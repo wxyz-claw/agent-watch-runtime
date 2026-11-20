@@ -1,0 +1,59 @@
+{
+  "name": "agent-watch-runtime",
+  "version": "0.1.0",
+  "description": "Persistent watches and signed webhook delivery for local agents",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "^22.13.0 || ^24.0.0 || ^26.0.0"
+  },
+  "bin": {
+    "agent-watch": "./bin/watch.mjs"
+  },
+  "exports": {
+    ".": "./src/index.mjs",
+    "./sdk": {
+      "types": "./src/sdk.d.mts",
+      "import": "./src/sdk.mjs"
+    },
+    "./sources": "./src/sources.mjs",
+    "./delivery": "./src/delivery.mjs",
+    "./mcp": "./src/mcp.mjs"
+  },
+  "files": [
+    "bin/watch.mjs",
+    "docs/contract.md",
+    "docs/setup.md",
+    "docs/sources.md",
+    "docs/work-ledger.md",
+    "examples/demo.mjs",
+    "scripts/check-changedetection-release.py",
+    "scripts/check-changedetection-replay.mjs",
+    "scripts/check-node.mjs",
+    "scripts/check-package.mjs",
+    "src/config.mjs",
+    "src/delivery.mjs",
+    "src/index.mjs",
+    "src/mcp.mjs",
+    "src/runtime.mjs",
+    "src/sdk.d.mts",
+    "src/sdk.mjs",
+    "src/sources.mjs",
+    "src/store.mjs",
+    "test/delivery.test.mjs",
+    "test/mcp.test.mjs",
+    "test/runtime.test.mjs",
+    "test/sdk.test.mjs",
+    "test/setup.test.mjs",
+    "test/sources.test.mjs"
+  ],
+  "scripts": {
+    "check:node": "node scripts/check-node.mjs",
+    "test": "node --test",
+    "test:contract": "node --test test/sdk.test.mjs test/mcp.test.mjs",
+    "demo": "node examples/demo.mjs",
+    "check:package": "node scripts/check-package.mjs",
+    "verify": "npm run check:node && npm test && npm run check:package"
+  }
+}

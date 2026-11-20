@@ -325,7 +325,8 @@ function diffSummary(raw, code) {
   if (!isDigest(raw.before_digest) || !isDigest(raw.after_digest) || typeof raw.truncated !== 'boolean') reject(code);
   arrayShape(raw.changes, MAX_CHANGES, code);
   const changes = [];
-  for (const entry of raw.changes) {
+  for (let i = 0; i < raw.changes.length; i++) {
+    const entry = raw.changes[i];
     fields(entry, ['op'], ['path', 'path_digest'], code);
     if (own(entry, 'path') === own(entry, 'path_digest')) reject(code);
     if (!['add', 'remove', 'replace'].includes(entry.op)) reject(code);

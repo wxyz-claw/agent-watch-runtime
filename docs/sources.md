@@ -42,4 +42,27 @@ Snapshot evidence records the raw byte digest and length, retained count and `hi
 
 ## Verification
 
-Run `node --test test/sources.test.mjs` from the repository root. The tests generate synthetic observations, temporary files and a loopback HTTP fixture with an ephemeral port and key. They exercise the v1 API paths, request authentication, text and JSON media types, coverage changes, stale data, retention, bounded responses and timeout handling. The paths and response semantics were checked against the official API v1 documentation (0.1.9) and its upstream implementation. Execution against an installed changedetection.io release is a separate compatibility check.
+Run `node --test test/sources.test.mjs` from the repository root. The tests generate synthetic observations, temporary files and a loopback HTTP fixture with an ephemeral port and key. They exercise the v1 API paths, request authentication, text and JSON media types, coverage changes, stale data, retention, bounded responses and timeout handling.
+
+### Optional pinned-release check
+
+The installed changedetection.io 0.70.4 release was verified on Python 3.14.6. Its watch model wrote two generated snapshots into a temporary directory. Flask's in-process client exercised the release's authenticated GET handlers. Metadata and retained history returned `200 application/json`. The timestamped snapshots, latest snapshot and timestamp-pair diff returned `200 text/plain`. An absent API key returned `403 application/json`, and unavailable snapshot and diff timestamps returned `404 application/json`. [PyPI release](https://pypi.org/project/changedetection.io/0.70.4/) · [Pinned handler implementation](https://github.com/dgtlmoon/changedetection.io/blob/3316f256acc5bc01708c85da83b3ee7347c503d8/changedetectionio/api/Watch.py)
+
+The harness checks all metadata used for health and freshness and checks the retained timestamp keys. A second process replays the captured response bodies and media types over loopback through the JavaScript bridge. The fixture's predicate changes from `FALSE` to `TRUE`, and the returned digest and byte count match the upstream text diff. The Flask phase blocks socket creation and subprocesses. urllib3's optional IPv6 probe was blocked at import before any socket opened. The upstream service, fetch scheduler and notification dispatcher are outside this check.
+
+From the repository root, use a disposable environment with an installed Python 3.14 and uv. The following commands install the verification-only wheels and keep generated captures in the temporary directory.
+
+```sh
+release_dir=$(mktemp -d)
+uv venv --python 3.14 "$release_dir/venv"
+release_python="$release_dir/venv/bin/python"
+uv pip install --python "$release_python" --only-binary :all: --no-deps changedetection.io==0.70.4
+uv pip install --python "$release_python" --only-binary :all: \
+  Flask==3.1.3 Flask-RESTful==0.3.10 Flask-Babel==4.0.0 Werkzeug==3.1.9 \
+  apprise==2.2.0 brotli==1.2.1 diff-match-patch==20241021 loguru==0.8.0 \
+  orjson==3.13.0 panzi-json-logic==1.0.1 pluggy==1.7.0 pydantic==2.14.4 \
+  pyyaml==6.0.3 urllib3==2.8.0 validators==0.36.0 websockets==17.4
+env -i PATH=/usr/bin:/bin TMPDIR="$release_dir" "$release_python" -I -B \
+  scripts/check-changedetection-release.py > "$release_dir/capture.json"
+node scripts/check-changedetection-replay.mjs "$release_dir/capture.json"
+```

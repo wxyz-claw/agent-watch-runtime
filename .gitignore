@@ -1,0 +1,7 @@
+node_modules/
+*.tgz
+*.sqlite
+*.sqlite-*
+*.key
+watch-dev/
+.DS_Store
