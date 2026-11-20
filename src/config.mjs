@@ -11,6 +11,26 @@ const format = 'agent-watch-runtime/dev-v1';
 const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
 const consumerId = 'worker';
 const leaseMs = 5000;
+const setupFaults = new Set(['receiver_already_running', 'receiver_registration_lost',
+  'invalid_development_directory', 'invalid_state_file', 'invalid_state_key', 'already_exists',
+  'missing_state', 'local_access_denied', 'receiver_bind_failed', 'storage_full',
+  'storage_io_error', 'storage_busy', 'storage_read_only', 'setup_failed']);
+const systemFaults = new Map([['EEXIST', 'already_exists'], ['ENOENT', 'missing_state'],
+  ['EPERM', 'local_access_denied'], ['EACCES', 'local_access_denied'], ['EADDRINUSE', 'receiver_bind_failed'],
+  ['ENOSPC', 'storage_full'], ['EDQUOT', 'storage_full'], ['EIO', 'storage_io_error'], ['EROFS', 'storage_read_only']]);
+const sqliteFaults = new Map([[5, 'storage_busy'], [6, 'storage_busy'], [8, 'storage_read_only'],
+  [10, 'storage_io_error'], [13, 'storage_full']]);
+
+/** Constrain subprocess diagnostics to static labels before reporting them. */
+export function setupFailure(error) {
+  if (setupFaults.has(error?.message)) return error.message;
+  const system = systemFaults.get(error?.code);
+  if (system) return system;
+  if (error?.code === 'ERR_SQLITE_ERROR' && Number.isInteger(error.errcode)) {
+    return sqliteFaults.get(error.errcode & 255) ?? 'setup_failed';
+  }
+  return 'setup_failed';
+}
 
 function freshFile(path, data) {
   writeFileSync(path, data, {flag: 'wx', mode: 0o600});

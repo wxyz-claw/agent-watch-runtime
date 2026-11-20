@@ -106,11 +106,7 @@ async function main() {
 try {
   process.exitCode = await main();
 } catch (error) {
-  const known = new Set(['receiver_already_running', 'receiver_registration_lost',
-    'invalid_development_directory', 'invalid_state_file', 'invalid_state_key']);
-  const systemCodes = new Map([['EEXIST', 'already_exists'], ['ENOENT', 'missing_state'],
-    ['EPERM', 'local_access_denied'], ['EACCES', 'local_access_denied'], ['EADDRINUSE', 'receiver_bind_failed']]);
-  const code = known.has(error.message) ? error.message : systemCodes.get(error.code) ?? 'setup_failed';
-  process.stderr.write(code + '\n');
+  const {setupFailure} = await import('../src/config.mjs');
+  process.stderr.write(setupFailure(error) + '\n');
   process.exitCode = 1;
 }

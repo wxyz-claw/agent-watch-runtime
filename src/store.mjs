@@ -133,22 +133,23 @@ export class WatchStore {
   history(watchId, {after_sequence = 0, limit = 20} = {}) {
     if (!validBound(after_sequence,0,Number.MAX_SAFE_INTEGER) || !validBound(limit,1,50)) throw Error('invalid_request');
     if (!this.one('SELECT 1 FROM watches WHERE watch_id=?',watchId)) throw Error('watch_not_found');
-    const events = [];
     let bytes = 0;
     let next_sequence = after_sequence;
     let has_more = false;
-    const rows = this.db.prepare(`SELECT sequence,body FROM events WHERE watch_id=? AND sequence>?
-      ORDER BY sequence LIMIT ?`).iterate(watchId,after_sequence,limit+1);
-    for (const row of rows) {
-      const size = Buffer.byteLength(row.body);
-      if (events.length === limit || bytes + size > 64 * 1024 - 1024) {
+    // Select the page boundaries before materializing immutable bodies. This
+    // bounds both response bytes and temporary memory on every supported Node version.
+    const sizes = this.db.prepare(`SELECT sequence,length(CAST(body AS BLOB)) AS bytes FROM events
+      WHERE watch_id=? AND sequence>? ORDER BY sequence LIMIT ?`).all(watchId,after_sequence,limit+1);
+    for (const [index,row] of sizes.entries()) {
+      if (index === limit || bytes + row.bytes > 64 * 1024 - 1024) {
         has_more = true;
         break;
       }
-      events.push(JSON.parse(row.body));
       next_sequence = row.sequence;
-      bytes += size;
+      bytes += row.bytes;
     }
+    const events = this.db.prepare(`SELECT body FROM events WHERE watch_id=? AND sequence>? AND sequence<=?
+      ORDER BY sequence`).all(watchId,after_sequence,next_sequence).map(row => JSON.parse(row.body));
     return {events,next_sequence,has_more};
   }
 

@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { initDevelopment, openDevelopment, claimReceiver } from '../src/config.mjs';
+import { initDevelopment, openDevelopment, claimReceiver, setupFailure } from '../src/config.mjs';
 
 const run = promisify(execFile);
 const cli = fileURLToPath(new URL('../bin/watch.mjs', import.meta.url));
@@ -54,6 +54,14 @@ test('setup rejects linked state files and an unrelated directory', async t => {
   await symlink(other, dev.runtimeDb);
   assert.throws(() => openDevelopment(directory));
   assert.deepEqual(await readFile(other), marker);
+});
+
+test('setup classifies storage failures without including paths or source strings', () => {
+  const message = randomBytes(24).toString('hex');
+  assert.equal(setupFailure({message, code: 'ENOSPC'}), 'storage_full');
+  assert.equal(setupFailure({message, code: 'ERR_SQLITE_ERROR', errcode: 13}), 'storage_full');
+  assert.equal(setupFailure({message, code: 'ERR_SQLITE_ERROR', errcode: 266}), 'storage_io_error');
+  assert.equal(setupFailure({message}), 'setup_failed');
 });
 
 test('invalid optional web configuration degrades its watch without exposing options', async t => {
@@ -224,7 +232,11 @@ test('simultaneous receiver starts elect one owner and a crashed owner can be re
     assert.equal(await loser.exited, 1);
     assert.match(loser.diagnostic(), /receiver_already_running/);
     const file = join(directory, 'receiver.json');
-    const old = JSON.parse(await readFile(file, 'utf8'));
+    const old = await readFile(file, 'utf8').then(JSON.parse).catch(error => {
+      const code = winner.diagnostic().split('\n').find(label => setupFailure({message: label}) === label);
+      const reason = code ?? setupFailure(error);
+      throw Error('receiver_publication_unavailable_' + (winner.child.exitCode ?? 'running') + '_' + reason);
+    });
     assert.equal(old.pid, winner.child.pid);
     assert.match(dev.routes.get('worker').url, /^http:\/\/127\.0\.0\.1:\d+\/inbox$/);
     winner.child.kill('SIGKILL');

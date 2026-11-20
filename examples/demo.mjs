@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
-import { openDevelopment } from '../src/config.mjs';
+import { openDevelopment, setupFailure } from '../src/config.mjs';
 import { WatchStore } from '../src/store.mjs';
 import { Inbox } from '../src/delivery.mjs';
 
@@ -15,8 +15,10 @@ let stage = 'initialize';
 function start(command, directory, children) {
   const child = spawn(process.execPath, [executable, command, directory], {env: {}, stdio: 'pipe'});
   const lines = createInterface({input: child.stdout, crlfDelay: Infinity})[Symbol.asyncIterator]();
-  // Child stderr can include platform diagnostics. The demo reports fixed errors.
-  child.stderr.resume();
+  let failure = 'child_closed';
+  createInterface({input: child.stderr, crlfDelay: Infinity}).on('line', line => {
+    if (setupFailure({message: line}) === line) failure = line;
+  });
   const exited = new Promise(resolve => {
     child.once('error', () => resolve(1));
     child.once('close', code => resolve(code ?? 1));
@@ -29,7 +31,10 @@ function start(command, directory, children) {
     send(frame) { child.stdin.write(JSON.stringify({jsonrpc: '2.0', ...frame}) + '\n'); },
     async read() {
       const {value, done} = await lines.next();
-      if (done) throw Error('child_closed');
+      if (done) {
+        await exited;
+        throw Error(failure);
+      }
       return JSON.parse(value);
     },
   };
@@ -49,23 +54,35 @@ async function demo() {
     stage = 'start_receiver';
     const receiver = start('receive', directory, children);
     assert.equal((await receiver.read()).state, 'listening');
-    stage = 'create_watch';
+    stage = 'start_mcp';
     const client = start('serve', directory, children);
     client.send({id: 1, method: 'initialize', params: {
       protocolVersion: '2025-11-25', clientInfo: {name: 'fixture-client', version: '1'}, capabilities: {},
     }});
     assert.equal((await client.read()).result.protocolVersion, '2025-11-25');
+    stage = 'call_watch_until';
     client.send({method: 'notifications/initialized'});
     client.send({id: 2, method: 'tools/call', params: {name: 'watch_until', arguments: {
       request_id: 'demo', source_id: 'json', consumer_id: 'worker', interval_ms: 40,
       predicate: {path: '/phase', equals: 'ready'},
     }}});
     const call = (await client.read()).result;
-    assert.equal(call.isError, false);
+    if (call.isError) {
+      const known = ['invalid_request', 'store_error', 'capacity', 'source_not_found', 'consumer_not_found'];
+      if (known.includes(call.structuredContent?.error)) stage += '_' + call.structuredContent.error;
+      throw Error('create_failed');
+    }
     const before = call.structuredContent;
+    stage = 'initial_state';
     assert.equal(before.state, 'active');
+    stage = 'initial_observation';
+    const codes = ['source_timeout', 'source_unavailable', 'source_invalid', 'source_error',
+      'coverage_partial', 'coverage_failed', 'invalid_observation', 'capacity', 'canceled'];
+    if (before.truth !== 'FALSE' && codes.includes(before.code)) stage += '_' + before.code;
     assert.equal(before.truth, 'FALSE');
+    stage = 'initial_sequence';
     assert.equal(before.sequence, 0);
+    stage = 'disconnect_mcp';
     client.child.stdin.end();
     assert.equal(await client.exited, 0);
 
@@ -116,7 +133,9 @@ async function demo() {
 
 try {
   process.stdout.write(JSON.stringify(await demo()) + '\n');
-} catch {
-  process.stderr.write('demo_failed_at_' + stage + '\n');
+} catch (error) {
+  const code = setupFailure(error);
+  const reason = code !== 'setup_failed' || error.message === 'setup_failed' ? '_' + code : '';
+  process.stderr.write('demo_failed_at_' + stage + reason + '\n');
   process.exitCode = 1;
 }

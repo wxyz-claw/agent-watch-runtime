@@ -9,6 +9,6 @@ const db = new DatabaseSync(':memory:');
 try {
   db.exec('CREATE TABLE probe(n INTEGER) STRICT; BEGIN IMMEDIATE; INSERT INTO probe VALUES(1); ROLLBACK');
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM probe').get().n,0);
-  assert.equal([...db.prepare("SELECT json_extract(?, '$.feature') AS value").iterate('{"feature":1}')][0].value,1);
+  assert.equal(db.prepare("SELECT json_extract(?, '$.feature') AS value").get('{"feature":1}').value,1);
   console.log('Node',process.version,'SQLite',db.prepare('SELECT sqlite_version() AS version').get().version);
 } finally { db.close(); }
