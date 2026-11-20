@@ -116,28 +116,35 @@ function activeContact(directory, namespace, key) {
 function optionalWebSource(directory) {
   const path = join(directory, 'web-source.json');
   if (!lstatSync(path, {throwIfNoEntry: false})) return null;
-  let reader;
-  return async context => {
-    if (!reader) {
-      try {
-        const bytes = readLocal(path, 4096);
-        const options = JSON.parse(new TextDecoder('utf-8', {fatal: true}).decode(bytes));
-        const fields = ['baseUrl', 'watchId', 'apiKey', 'maxAgeMs', 'timeoutMs'];
-        if (!options || typeof options !== 'object' || Array.isArray(options) ||
-            !Object.hasOwn(options, 'baseUrl') || !Object.hasOwn(options, 'watchId') ||
-            Object.keys(options).some(key => !fields.includes(key))) throw Error('invalid_web_source');
-        reader = changedetectionSource(options);
-      } catch {
-        // Keep configuration failures local to this source. Its raw options
-        // and parsing diagnostics can contain a development API key.
-        reader = ({mode}) => ({
-          version: 1, contract: {until: 'durable_ready', changes: 'observe_change', emitted: 'source_emitted'}[mode],
-          coverage: 'failed', authority: 'advisory', code: 'source_invalid',
-        });
-      }
+  function load() {
+    try {
+      const bytes = readLocal(path, 4096);
+      const options = JSON.parse(new TextDecoder('utf-8', {fatal: true}).decode(bytes));
+      const fields = ['baseUrl', 'watchId', 'apiKey', 'maxAgeMs', 'timeoutMs'];
+      if (!options || typeof options !== 'object' || Array.isArray(options) ||
+          !Object.hasOwn(options, 'baseUrl') || !Object.hasOwn(options, 'watchId') ||
+          Object.keys(options).some(key => !fields.includes(key))) throw Error('invalid_web_source');
+      return changedetectionSource(options);
+    } catch {
+      // A configuration or parse error can contain a development API key.
+      return null;
     }
-    return reader(context);
-  };
+  }
+
+  let reader;
+  async function observe(context, preview) {
+    const selected = reader === undefined ? load() : reader;
+    // Preview leaves the regular reader's lazy initialization untouched.
+    if (!preview) reader = selected;
+    if (!selected) return {
+      version: 1, contract: {until: 'durable_ready', changes: 'observe_change', emitted: 'source_emitted'}[context.mode],
+      coverage: 'failed', authority: 'advisory', code: 'source_invalid',
+    };
+    return preview ? selected.preview(context) : selected(context);
+  }
+  return Object.defineProperty(context => observe(context, false), 'preview', {
+    value: context => observe(context, true),
+  });
 }
 
 export function openDevelopment(path) {

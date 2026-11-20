@@ -319,9 +319,10 @@ test('v1 store upgrades preserve existing immutable bytes and seed durable retry
   const {watch_id} = await h.rt.create('until',until);
   const original = events(h.store,watch_id);
   h.store.db.exec(`ALTER TABLE outbox DROP COLUMN max_attempts; ALTER TABLE outbox DROP COLUMN retry_base_ms;
-    ALTER TABLE outbox DROP COLUMN retry_cap_ms; DROP TABLE delivery_routes; PRAGMA user_version=1;`);
+    ALTER TABLE outbox DROP COLUMN retry_cap_ms; ALTER TABLE outbox DROP COLUMN retry_jitter_ms;
+    DROP TABLE manual_checks; DROP TABLE watch_configs; DROP TABLE delivery_routes; PRAGMA user_version=1;`);
   await h.reopen();
-  assert.equal(h.store.one('PRAGMA user_version').user_version,3);
+  assert.equal(h.store.one('PRAGMA user_version').user_version,4);
   assert.deepEqual(events(h.store,watch_id),original);
   assert.equal(h.rt.get(watch_id).delivery_head.max_attempts,6);
 });

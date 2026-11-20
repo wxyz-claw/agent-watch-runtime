@@ -62,10 +62,27 @@ test('tools become available after negotiated initialization and a client notifi
   assert.deepEqual(results.map(x => x.id), [0, 1, 1, 2, 3, 4, 5]);
   assert.deepEqual(results.slice(0, 4).map(x => x.error?.code), [-32002, -32602, undefined, -32002]);
   const list = results[4].result.tools;
-  assert.deepEqual(list.map(x => x.name), ['watch_until', 'watch_changes', 'watch_emitted', 'get_watch', 'cancel_watch', 'read_events']);
+  assert.deepEqual(list.map(x => x.name), [
+    'watch_until', 'watch_changes', 'watch_emitted', 'get_watch', 'cancel_watch', 'read_events',
+    'create_watch', 'preview_watch', 'list_watches', 'pause_watch', 'resume_watch', 'update_watch', 'check_now',
+  ]);
   assert.ok(list.every(tool => tool.inputSchema.additionalProperties === false));
   assert.deepEqual(list[0].inputSchema.required, ['source_id', 'consumer_id', 'request_id', 'predicate']);
   assert.deepEqual(list[0].inputSchema.properties.predicate.oneOf, [{ required: ['equals'] }, { required: ['contains'] }]);
+  const schemas = new Map(list.map(x => [x.name, x.inputSchema]));
+  const config = schemas.get('create_watch').properties.config;
+  assert.equal(config.properties.version.const, 1);
+  assert.deepEqual(config.then.required, ['predicate']);
+  assert.deepEqual(config.else.not.required, ['predicate']);
+  assert.equal(config.additionalProperties, false);
+  assert.equal(config.properties.delivery.additionalProperties, false);
+  assert.deepEqual(config.properties.deadline_ms.type, ['integer', 'null']);
+  assert.deepEqual(config, schemas.get('preview_watch').properties.config);
+  const patch = schemas.get('update_watch').properties.patch;
+  assert.equal(patch.properties.version.const, 1);
+  assert.equal(patch.minProperties, 2);
+  assert.equal(patch.additionalProperties, false);
+  assert.equal(schemas.get('list_watches').properties.limit.default, 20);
   assert.equal(results[5].error.code, -32600);
   assert.deepEqual(results[6].result, {});
 });
@@ -117,6 +134,107 @@ test('malformed calls have protocol errors and invalid tool arguments never reac
   const invalid = results.slice(4);
   assert.equal(invalid.length, cases.length);
   assert.ok(invalid.every(r => r.result.isError && r.result.structuredContent.error === 'invalid_request'));
+});
+
+const controls = ['createConfigured', 'preview', 'list', 'pause', 'resume', 'update', 'checkNow'];
+const minimalConfig = { version: 1, mode: 'changes', source_id: 'source-1', consumer_id: 'consumer-1' };
+
+test('controls pass the requested configuration, edit, revision and operation sequence to the runtime', async () => {
+  const trace = [];
+  const runtime = Object.fromEntries(controls.map(name => [name, (...args) => {
+    trace.push([name, ...args]);
+    return { operation: name };
+  }]));
+  const full = {
+    ...minimalConfig, mode: 'until', predicate: { path: '/phase', equals: 'ready' },
+    interval_ms: 20, deadline_ms: null, delivery: { enabled: false },
+  };
+  const paused = { watch_id: 'watch-1', expected_revision: 1 };
+  const filtered = { state: 'paused', after: 'watch-1', limit: 50 };
+  const patch = { version: 1, deadline_ms: null, delivery: { enabled: true }, interval_ms: 86400000 };
+  const high = Number.MAX_SAFE_INTEGER;
+  const requests = [
+    ['create_watch', { config: minimalConfig, request_id: 'req-1' }],
+    ['preview_watch', { config: minimalConfig }],
+    ['preview_watch', { config: full, watch_id: 'watch-1' }],
+    ['list_watches', {}], ['list_watches', filtered], ['pause_watch', paused],
+    ['resume_watch', { ...paused, expected_revision: high }],
+    ['update_watch', { ...paused, patch }],
+    ['check_now', { ...paused, operation_seq: high }], ['check_now', { ...paused, operation_seq: high }],
+  ];
+  const replies = await exchange([encode([...initialize(), ...requests.map(([name, args], i) => call(i + 2, name, args))])], runtime);
+  assert.deepEqual(trace, [
+    ['createConfigured', minimalConfig, 'req-1'], ['preview', minimalConfig, undefined], ['preview', full, 'watch-1'],
+    ['list', {}], ['list', filtered], ['pause', 'watch-1', 1], ['resume', 'watch-1', high],
+    ['update', 'watch-1', 1, patch], ['checkNow', 'watch-1', 1, high], ['checkNow', 'watch-1', 1, high],
+  ]);
+  for (const [index, reply] of replies.slice(1).entries()) {
+    assert.equal(reply.result.isError, false);
+    assert.deepEqual(reply.result.structuredContent, { operation: trace[index][0] });
+    assert.deepEqual(reply.result.structuredContent, JSON.parse(reply.result.content[0].text));
+  }
+});
+
+test('control argument validation rejects unregistered endpoint fields and malformed nested configurations before dispatch', async () => {
+  const fixtureUrl = 'http://127.0.0.1:1/inbox';
+  const marker = 'generated-unaccepted-field';
+  const predicate = { path: '/state', equals: 'ready' };
+  const invalidConfigs = [
+    null, [], { ...minimalConfig, version: 2 }, { ...minimalConfig, mode: 'other' },
+    { ...minimalConfig, mode: 'until' }, { ...minimalConfig, mode: 'until', predicate: { path: 'state', equals: true } },
+    { ...minimalConfig, predicate }, { ...minimalConfig, mode: 'emitted', predicate },
+    { ...minimalConfig, interval_ms: 19 }, { ...minimalConfig, deadline_ms: -1 },
+    { ...minimalConfig, source_id: fixtureUrl }, { ...minimalConfig, url: fixtureUrl }, { ...minimalConfig, key: marker },
+    { ...minimalConfig, delivery: { enabled: true, url: fixtureUrl } },
+    { ...minimalConfig, delivery: { enabled: false, key: marker } }, { ...minimalConfig, delivery: { enabled: 1 } },
+  ];
+  const target = { watch_id: 'watch-1', expected_revision: 1 };
+  const invalidPatches = [
+    null, { version: 1 }, { version: 2, interval_ms: 20 }, { version: 1, interval_ms: 86400001 },
+    { version: 1, deadline_ms: false }, { version: 1, source_id: 'other' }, { version: 1, mode: 'until' },
+    { version: 1, consumer_id: 'other' }, { version: 1, predicate: { path: '/', equals: 1, contains: '1' } },
+    { version: 1, delivery: { enabled: true, url: fixtureUrl } }, { version: 1, key: marker },
+  ];
+  const cases = [
+    ...invalidConfigs.flatMap(config => [
+      ['create_watch', { config, request_id: 'request-1' }], ['preview_watch', { config }],
+    ]),
+    ...invalidPatches.map(patch => ['update_watch', { ...target, patch }]),
+    ['create_watch', { config: minimalConfig }], ['preview_watch', { config: minimalConfig, watch_id: '' }],
+    ['list_watches', { state: 'pending' }], ['list_watches', { after: fixtureUrl }], ['list_watches', { limit: 0 }],
+    ['list_watches', { limit: 51 }], ['list_watches', { state: 'active', endpoint: fixtureUrl }],
+    ['pause_watch', { watch_id: 'watch-1' }], ['pause_watch', { ...target, expected_revision: 0 }],
+    ['resume_watch', { ...target, expected_revision: 1.25 }], ['resume_watch', { ...target, expected_revision: Number.MAX_SAFE_INTEGER + 1 }],
+    ['check_now', target], ['check_now', { ...target, operation_seq: 0 }], ['check_now', { ...target, operation_seq: '1' }],
+    ['check_now', { ...target, operation_seq: Number.MAX_SAFE_INTEGER + 1 }],
+  ];
+  let calls = 0;
+  const runtime = Object.fromEntries(controls.map(name => [name, () => { calls++; return {}; }]));
+  const replies = await exchange([encode([...initialize(), ...cases.map(([name, args], i) => call(i + 2, name, args))])], runtime);
+  assert.equal(calls, 0);
+  assert.equal(replies.length, cases.length + 1);
+  for (const reply of replies.slice(1)) {
+    assert.equal(reply.result.isError, true);
+    assert.deepEqual(reply.result.structuredContent, { error: 'invalid_request' });
+  }
+  const text = JSON.stringify(replies);
+  assert.ok(!text.includes(marker));
+  assert.ok(!text.includes(fixtureUrl));
+});
+
+test('control failures preserve the documented error categories and redact arbitrary diagnostic detail', async () => {
+  const codes = ['revision_conflict', 'watch_terminal', 'watch_paused', 'operation_conflict', 'check_pending', 'unsupported_control'];
+  const runtime = { async checkNow(_id, _revision, sequence) {
+    throw Object.assign(new Error('synthetic-runtime-detail'), { code: codes[sequence - 1] ?? 'generated-unknown-code' });
+  } };
+  const requests = Array.from({ length: codes.length + 1 }, (_, i) => call(i + 2, 'check_now', {
+    watch_id: 'watch-1', expected_revision: 1, operation_seq: i + 1,
+  }));
+  const replies = await exchange([encode([...initialize(), ...requests])], runtime);
+  assert.deepEqual(replies.slice(1).map(r => r.result.structuredContent.error), [...codes, 'store_error']);
+  assert.ok(replies.slice(1).every(r => r.result.isError));
+  assert.ok(!JSON.stringify(replies).includes('synthetic-runtime-detail'));
+  assert.ok(!JSON.stringify(replies).includes('generated-unknown-code'));
 });
 
 test('runtime failures yield only fixed diagnostic codes', async () => {

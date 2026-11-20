@@ -52,9 +52,15 @@ function sha256(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
-function withBudget(timeoutMs, reader) {
+// These readers obtain a fresh observation from the supplied checkpoint.
+// The runtime owns cursor advancement and acknowledgements.
+function nonconsumingSource(read) {
+  return Object.defineProperty(read, 'preview', {value: read});
+}
+
+function boundedSnapshotSource(timeoutMs, reader) {
   if (!integer(timeoutMs, 1, 30_000)) throw new TypeError('invalid_source_timeout');
-  return async (context) => {
+  return nonconsumingSource(async (context) => {
     const contract = MODES.get(context.mode);
     if (!contract || context.mode === 'emitted') {
       return failed('observe_change', 'unsupported_contract');
@@ -78,7 +84,7 @@ function withBudget(timeoutMs, reader) {
     } finally {
       if (onAbort) signal.removeEventListener('abort', onAbort);
     }
-  };
+  });
 }
 
 /** A fixture frame supplies a value and, optionally, coverage, authority and an emitted ID. */
@@ -101,7 +107,7 @@ export function syntheticSource(frames) {
     if (totalBytes > 1_048_576) throw new TypeError('invalid_synthetic_frames');
     return record;
   });
-  return async ({checkpoint, mode, signal}) => {
+  return nonconsumingSource(async ({checkpoint, mode, signal}) => {
     const contract = MODES.get(mode);
     if (!contract) return failed('observe_change', 'unsupported_contract');
     if (signal?.aborted) return failed(contract, 'canceled');
@@ -118,7 +124,7 @@ export function syntheticSource(frames) {
       ...(mode === 'emitted' && {source_event_id}),
       ...(code !== undefined && {code}),
     }, contract);
-  };
+  });
 }
 
 async function fixturePath(file) {
@@ -138,7 +144,7 @@ export function jsonSource(path, {timeoutMs = DEFAULT_TIMEOUT_MS} = {}) {
       || path.includes('\0') || resolve(path) !== path) {
     throw new TypeError('invalid_source_path');
   }
-  return withBudget(timeoutMs, async (_context, contract, signal) => {
+  return boundedSnapshotSource(timeoutMs, async (_context, contract, signal) => {
     const file = await fixturePath(path);
     signal.throwIfAborted();
     let handle;
@@ -255,7 +261,7 @@ export function changedetectionSource({baseUrl, watchId, apiKey, maxAgeMs = 300_
   }
   const port = Number(host[1]);
   const prefix = '/api/v1/watch/' + watchId;
-  return withBudget(timeoutMs, async ({checkpoint, now, mode}, contract, signal) => {
+  return boundedSnapshotSource(timeoutMs, async ({checkpoint, now, mode}, contract, signal) => {
     if (!integer(now, 0, Number.MAX_SAFE_INTEGER)) throw new SourceFault('source_invalid');
     const read = (suffix, format = 'application/json', limit = META_BYTES, budget = signal) =>
       readApi(port, prefix + suffix, apiKey, format, limit, budget);
