@@ -36,12 +36,18 @@ const createFields = ['source_id', 'consumer_id', 'request_id'];
 const createSchema = objectSchema(createProperties, createFields);
 const untilSchema = objectSchema({ ...createProperties, predicate: predicateSchema }, [...createFields, 'predicate']);
 const existingSchema = objectSchema({ watch_id: identifier }, ['watch_id']);
+const historySchema = objectSchema({
+  watch_id: identifier,
+  after_sequence: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER, default: 0, description: 'Last sequence already read.' },
+  limit: { type: 'integer', minimum: 1, maximum: 50, default: 20, description: 'Maximum events in this page.' },
+}, ['watch_id']);
 const definitions = [
   { name: 'watch_until', description: 'Observe a registered source until an authoritative snapshot satisfies the predicate.', inputSchema: untilSchema },
   { name: 'watch_changes', description: 'Compare reliable snapshots and deliver observed changes.', inputSchema: createSchema },
   { name: 'watch_emitted', description: 'Deliver source-emitted events with durable source identity.', inputSchema: createSchema },
   { name: 'get_watch', description: 'Read watch status and delivery diagnostics.', inputSchema: existingSchema },
   { name: 'cancel_watch', description: 'Cancel an active watch.', inputSchema: existingSchema },
+  { name: 'read_events', description: 'Read a page of committed events in per-watch sequence order.', inputSchema: historySchema },
 ];
 const byName = new Map(definitions.map(tool => [tool.name, tool]));
 const modes = new Map([['watch_until', 'until'], ['watch_changes', 'changes'], ['watch_emitted', 'emitted']]);
@@ -98,7 +104,10 @@ async function callTool(runtime, tool, args) {
     let status;
     if (tool.name === 'get_watch') status = await runtime.get(validated.watch_id);
     else if (tool.name === 'cancel_watch') status = await runtime.cancel(validated.watch_id);
-    else status = await runtime.create(modes.get(tool.name), validated);
+    else if (tool.name === 'read_events') {
+      const { watch_id, after_sequence = 0, limit = 20 } = validated;
+      status = await runtime.history(watch_id, { after_sequence, limit });
+    } else status = await runtime.create(modes.get(tool.name), validated);
     if (status === null || status === undefined) return toolResult({ error: 'watch_not_found' }, true);
     if (!isObject(status)) return toolResult({ error: 'store_error' }, true);
     return toolResult(status);

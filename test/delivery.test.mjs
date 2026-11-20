@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
-import { createReceiver, deliverOnce, Inbox } from '../src/delivery.mjs';
+import { createReceiver, deliverOnce, Inbox, syncDeliveryRoutes } from '../src/delivery.mjs';
 import { MAX_EVENT_BYTES, sealEvent } from '../src/sdk.mjs';
 
 const NOW = 1_700_000_000_000;
@@ -350,4 +350,144 @@ test('sender enforces route and response limits with fixed diagnostic codes', as
   assert.equal((await deliverOnce(store, routes, { now: NOW })).code, 'response_too_large');
   route(await f.listen(createServer(() => {})));
   assert.equal((await deliverOnce(store, routes, { now: NOW, timeoutMs: 50 })).code, 'delivery_timeout');
+});
+
+test('response policy accepts bounded delta-seconds and HTTP dates relative to receipt', async t => {
+  const f = workspace(t);
+  let status;
+  let hint;
+  let clock;
+  const port = await f.listen(createServer((_req, res) => {
+    clock = NOW + 1000;
+    res.writeHead(status, hint === undefined ? {} : { 'retry-after': hint }).end('fixture reply');
+  }));
+  const routes = new Map([[CONSUMER, { url: `http://127.0.0.1:${port}/inbox`, keyId: 'key', key: randomBytes(32) }]]);
+  for (const [reply, field, code, delay] of [
+    [429, '17', 'rate_limited', 17_000],
+    [429, '0', 'rate_limited', 0],
+    [429, '0002', 'rate_limited', 2000],
+    [429, '9'.repeat(128), 'rate_limited', 3_600_000],
+    [503, new Date(NOW + 6000).toUTCString(), 'rate_limited', 5000],
+    [503, 'Tuesday, 14-Nov-23 22:13:26 GMT', 'rate_limited', 5000],
+    [503, 'Tue Nov 14 22:13:26 2023', 'rate_limited', 5000],
+    [429, new Date(NOW - 3000).toUTCString(), 'rate_limited', 0],
+    [429, new Date(NOW + 86_400_000).toUTCString(), 'rate_limited', 3_600_000],
+    [429, '-2', 'rate_limited'],
+    [429, '0.5', 'rate_limited'],
+    [429, new Date(NOW + 2000).toISOString(), 'rate_limited'],
+    [503, 'Wed, 14 Nov 2023 22:13:26 GMT', 'http_rejected'],
+    [503, ['5', '12'], 'http_rejected'],
+    [503, undefined, 'http_rejected'],
+    [410, '15', 'endpoint_gone'],
+    [400, '15', 'http_rejected'],
+    [202, '15', 'accepted'],
+  ]) {
+    status = reply;
+    hint = field;
+    clock = NOW;
+    const store = outbox(makeEvent());
+    const result = await deliverOnce(store, routes, { now: () => clock });
+    const expected = { accepted: code === 'accepted', code, now: NOW + 1000 };
+    if (delay !== undefined) expected.retryAfterMs = delay;
+    assert.deepEqual(store.outcomes, [expected]);
+    assert.equal(result.code, code);
+    assert.equal(result.retryAfterMs, delay);
+  }
+});
+
+test('route snapshots copy keys, isolate getter failures and persist only stable keyed fingerprints', () => {
+  let key = randomBytes(32);
+  let port = 32101;
+  let keyId = 'first';
+  const reads = { url: 0, keyId: 0, key: 0 };
+  const valid = {
+    get url() { reads.url++; return `http://127.0.0.1:${port}/inbox`; },
+    get keyId() { reads.keyId++; return keyId; },
+    get key() { reads.key++; return key; },
+  };
+  const rows = [];
+  const store = { syncRoute: (...row) => rows.push(row) };
+  const routes = new Map([
+    ['unavailable', { get url() { throw new Error('fixture detail'); } }],
+    [CONSUMER, valid],
+  ]);
+  const snapshots = syncDeliveryRoutes(store, routes, NOW);
+  const first = snapshots.get(CONSUMER);
+  assert.equal(snapshots.get('unavailable'), null);
+  assert.deepEqual(reads, { url: 1, keyId: 1, key: 1 });
+  assert.match(first.fingerprint, /^[a-f0-9]{64}$/);
+  assert.deepEqual(rows, [[CONSUMER, first.fingerprint, NOW]]);
+  assert.equal(Object.isFrozen(first), true);
+  const original = Buffer.from(key);
+  first.key.fill(0);
+  assert.deepEqual(first.key, original);
+  const next = () => syncDeliveryRoutes(store, routes, NOW).get(CONSUMER).fingerprint;
+  assert.equal(next(), first.fingerprint);
+  port++;
+  const newEndpoint = next();
+  assert.notEqual(newEndpoint, first.fingerprint);
+  keyId = 'second';
+  const newId = next();
+  assert.notEqual(newId, newEndpoint);
+  key.fill(0);
+  assert.notEqual(next(), newId);
+  assert.deepEqual(first.key, original);
+});
+
+test('responses from a retired route cannot accept, pause or delay the replacement', async t => {
+  const f = workspace(t);
+  const sink = f.open();
+  const replacement = { keyId: 'second', key: randomBytes(32) };
+  const listener = createReceiver({
+    inbox: sink, consumerId: CONSUMER, keys: new Map([[replacement.keyId, replacement.key]]), now: NOW,
+  });
+  const toReplacement = observeWire(listener);
+  const newPort = await f.listen(listener);
+  replacement.url = `http://127.0.0.1:${newPort}/inbox`;
+  for (const retiredStatus of [410, 429, 202]) {
+    const routes = new Map();
+    const old = createServer((_req, res) => {
+      routes.set(CONSUMER, replacement);
+      res.writeHead(retiredStatus, { 'retry-after': '600' }).end();
+    });
+    const original = observeWire(old);
+    const oldPort = await f.listen(old);
+    routes.set(CONSUMER, { url: `http://127.0.0.1:${oldPort}/inbox`, keyId: 'first', key: randomBytes(32) });
+    const event = makeEvent();
+    const store = outbox(event);
+    const generations = [];
+    store.syncRoute = (_consumer, fingerprint) => { generations.push(fingerprint); };
+    const retired = await deliverOnce(store, routes, { now: NOW });
+    assert.equal(retired.code, 'route_changed');
+    assert.equal(retired.accepted, false);
+    assert.deepEqual(store.outcomes, [{ accepted: false, code: 'route_changed', now: NOW }]);
+    assert.equal(generations.length, 2);
+    assert.notEqual(generations[0], generations[1]);
+    assert.equal((await deliverOnce(store, routes, { now: NOW })).code, 'accepted');
+    assert.equal(sink.status(CONSUMER, event.event_id).digest, event.digest);
+    assert.deepEqual(original[0].body, toReplacement.at(-1).body);
+    await f.stop(old);
+  }
+});
+
+test('an already claimed event for an older route is fenced before dispatch', async t => {
+  const f = workspace(t);
+  let hits = 0;
+  const port = await f.listen(createServer((_req, res) => { hits++; res.writeHead(202).end(); }));
+  const route = { url: `http://127.0.0.1:${port}/inbox`, keyId: 'one', key: randomBytes(32) };
+  const routes = new Map([[CONSUMER, route]]);
+  const store = outbox(makeEvent());
+  const prior = syncDeliveryRoutes(store, routes, NOW).get(CONSUMER);
+  const acquired = { ...store.claimDelivery(), route_ref: prior.fingerprint };
+  route.key = randomBytes(32);
+  const snapshots = syncDeliveryRoutes(store, routes, NOW);
+  const result = await deliverOnce(store, routes, { now: NOW, claim: acquired, snapshots });
+  assert.equal(hits, 0);
+  assert.equal(result.code, 'route_changed');
+  assert.deepEqual(store.outcomes, [{ accepted: false, code: 'route_changed', now: NOW }]);
+  const withoutRoute = await deliverOnce(store, routes, {
+    now: NOW, claim: { ...acquired, route_ref: null }, snapshots,
+  });
+  assert.equal(withoutRoute.code, 'route_changed');
+  assert.equal(hits, 0);
 });

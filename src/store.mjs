@@ -4,7 +4,10 @@ import { canonical, digest, diffEvidence, evaluatePredicate, isAuthoritativeObse
 
 const APP_ID = 0x41575231;
 const deliveryCodes = new Set(['accepted', 'route_unavailable', 'invalid_event', 'delivery_timeout',
-  'transport_error', 'response_too_large', 'http_rejected']);
+  'transport_error', 'response_too_large', 'http_rejected', 'endpoint_gone', 'rate_limited', 'route_changed']);
+const routeSchema = `CREATE TABLE delivery_routes (
+  consumer_id TEXT PRIMARY KEY, fingerprint TEXT, paused INTEGER NOT NULL DEFAULT 0 CHECK(paused IN (0,1))
+)`;
 const schema = `
   CREATE TABLE watches (
     watch_id TEXT PRIMARY KEY, consumer_id TEXT NOT NULL, request_id TEXT NOT NULL,
@@ -26,7 +29,8 @@ const schema = `
   );
   CREATE TABLE outbox (
     event_id TEXT PRIMARY KEY REFERENCES events(event_id), state TEXT NOT NULL DEFAULT 'pending',
-    attempt INTEGER NOT NULL DEFAULT 0, next_ms INTEGER NOT NULL, token TEXT, lease_ms INTEGER, code TEXT
+    attempt INTEGER NOT NULL DEFAULT 0, next_ms INTEGER NOT NULL, token TEXT, lease_ms INTEGER, code TEXT,
+    max_attempts INTEGER NOT NULL, retry_base_ms INTEGER NOT NULL, retry_cap_ms INTEGER NOT NULL
   );
   CREATE INDEX delivery_due ON outbox(state,next_ms);
 `;
@@ -50,11 +54,24 @@ export class WatchStore {
       this.transaction(() => {
         const {application_id} = this.one('PRAGMA application_id');
         const {user_version} = this.one('PRAGMA user_version');
-        if (application_id === APP_ID && user_version === 1) return;
+        if (application_id === APP_ID && user_version === 3) return;
+        if (application_id === APP_ID && [1,2].includes(user_version)) {
+          if (user_version === 1) {
+            this.db.exec(`ALTER TABLE outbox ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 6;
+              ALTER TABLE outbox ADD COLUMN retry_base_ms INTEGER NOT NULL DEFAULT 250;
+              ALTER TABLE outbox ADD COLUMN retry_cap_ms INTEGER NOT NULL DEFAULT 60000;`);
+            this.run('UPDATE outbox SET max_attempts=?, retry_base_ms=?, retry_cap_ms=?',maxAttempts,baseDelayMs,maxDelayMs);
+          }
+          this.db.exec(routeSchema);
+          this.db.exec('INSERT INTO delivery_routes(consumer_id) SELECT DISTINCT consumer_id FROM watches');
+          this.db.exec('PRAGMA user_version=3');
+          return;
+        }
         if (application_id || user_version || this.one('SELECT name FROM sqlite_schema LIMIT 1')) throw Error('store_error');
         this.db.exec(schema);
+        this.db.exec(routeSchema);
         this.db.exec(`PRAGMA application_id=${APP_ID}`);
-        this.db.exec('PRAGMA user_version=1');
+        this.db.exec('PRAGMA user_version=3');
       });
       this.db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON');
     } catch {
@@ -90,6 +107,7 @@ export class WatchStore {
       }
       if (this.one('SELECT COUNT(*) AS n FROM watches').n >= this.maxWatches) throw Error('capacity');
       const watch_id = randomUUID();
+      this.run('INSERT OR IGNORE INTO delivery_routes(consumer_id) VALUES (?)',consumer_id);
       this.run(`INSERT INTO watches(watch_id,consumer_id,request_id,source_id,mode,definition,deadline_ms,interval_ms,next_read_ms)
         VALUES (?,?,?,?,?,?,?,?,?)`,watch_id,consumer_id,request_id,source_id,mode,encoded,deadline_ms,interval_ms,scheduled ? now : null);
       return {watch_id, created:true};
@@ -103,9 +121,35 @@ export class WatchStore {
     const delivery = {pending:0,running:0,accepted:0,dead:0};
     for (const item of this.db.prepare(`SELECT o.state,COUNT(*) AS n FROM outbox o JOIN events e USING(event_id)
       WHERE e.watch_id=? GROUP BY o.state`).all(watchId)) delivery[item.state] = item.n;
-    const failure = this.one(`SELECT o.code,e.sequence FROM outbox o JOIN events e USING(event_id)
+    const failure = this.one(`SELECT o.code,e.event_id,e.sequence,o.attempt,o.max_attempts FROM outbox o JOIN events e USING(event_id)
       WHERE e.watch_id=? AND o.state='dead' ORDER BY e.sequence LIMIT 1`,watchId);
-    return {...row,delivery,dead_letter:failure ? {...failure} : null};
+    const next = this.one(`SELECT e.event_id,e.sequence,o.state,o.attempt,o.max_attempts,o.next_ms,o.lease_ms,o.code
+      FROM outbox o JOIN events e USING(event_id) WHERE e.watch_id=? AND o.state!='accepted' ORDER BY e.sequence LIMIT 1`,watchId);
+    const route = this.one('SELECT paused FROM delivery_routes WHERE consumer_id=?',row.consumer_id);
+    return {...row,delivery,delivery_paused:route.paused === 1,delivery_head:next ? {...next} : null,
+      dead_letter:failure ? {...failure} : null};
+  }
+
+  history(watchId, {after_sequence = 0, limit = 20} = {}) {
+    if (!validBound(after_sequence,0,Number.MAX_SAFE_INTEGER) || !validBound(limit,1,50)) throw Error('invalid_request');
+    if (!this.one('SELECT 1 FROM watches WHERE watch_id=?',watchId)) throw Error('watch_not_found');
+    const events = [];
+    let bytes = 0;
+    let next_sequence = after_sequence;
+    let has_more = false;
+    const rows = this.db.prepare(`SELECT sequence,body FROM events WHERE watch_id=? AND sequence>?
+      ORDER BY sequence LIMIT ?`).iterate(watchId,after_sequence,limit+1);
+    for (const row of rows) {
+      const size = Buffer.byteLength(row.body);
+      if (events.length === limit || bytes + size > 64 * 1024 - 1024) {
+        has_more = true;
+        break;
+      }
+      events.push(JSON.parse(row.body));
+      next_sequence = row.sequence;
+      bytes += size;
+    }
+    return {events,next_sequence,has_more};
   }
 
   append(row, kind, evidence, now) {
@@ -113,7 +157,10 @@ export class WatchStore {
     const event = sealEvent({version:1,event_id:randomUUID(),watch_id:row.watch_id,sequence,kind,observed_at:now,evidence});
     const body = JSON.stringify(event);
     this.run('INSERT INTO events(event_id,watch_id,sequence,body) VALUES (?,?,?,?)',event.event_id,row.watch_id,sequence,body);
-    this.run('INSERT INTO outbox(event_id,next_ms) VALUES (?,?)',event.event_id,now);
+    const paused = this.one('SELECT paused FROM delivery_routes WHERE consumer_id=?',row.consumer_id).paused === 1;
+    this.run(`INSERT INTO outbox(event_id,next_ms,state,code,max_attempts,retry_base_ms,retry_cap_ms)
+      VALUES (?,?,?,?,?,?,?)`,event.event_id,now,paused ? 'paused' : 'pending',paused ? 'endpoint_gone' : null,
+      this.maxAttempts,this.baseDelayMs,this.maxDelayMs);
     this.run('UPDATE watches SET sequence=? WHERE watch_id=?',sequence,row.watch_id);
   }
 
@@ -201,9 +248,16 @@ export class WatchStore {
           seenKey = digest(obs.source_event_id);
           const prior = this.one('SELECT payload_digest FROM emitted WHERE watch_id=? AND source_event_digest=?',row.watch_id,seenKey);
           if (prior) {
-            advance = false;
-            if (prior.payload_digest === payloadHash) truth = 'FALSE';
-            else { coverage = 'failed'; code = 'source_invalid'; }
+            if (prior.payload_digest === payloadHash) {
+              // A trusted reader may consume a replay at a new continuation position.
+              // An unsolicited duplicate cannot move the reader's cursor.
+              advance = scheduled;
+              truth = 'FALSE';
+            } else {
+              advance = false;
+              coverage = 'failed';
+              code = 'source_invalid';
+            }
           } else {
             truth = 'TRUE';
             kind = 'emitted';
@@ -234,29 +288,84 @@ export class WatchStore {
     });
   }
 
-  claimDelivery(now) {
+  syncRoute(consumerId, fingerprint, now) {
+    if (!/^[0-9a-f]{64}$/.test(fingerprint)) throw Error('invalid_request');
+    const find = () => this.one('SELECT fingerprint,paused FROM delivery_routes WHERE consumer_id=?',consumerId);
+    const known = find();
+    if (!known || known.fingerprint === fingerprint) return;
+    this.transaction(() => {
+      const current = find();
+      if (current.fingerprint === fingerprint) return;
+      this.run('UPDATE delivery_routes SET fingerprint=?,paused=0 WHERE consumer_id=?',fingerprint,consumerId);
+      if (current.fingerprint === null && !current.paused) return;
+      // Invalidate leased work from the old destination. Preserve an ordinary retry's existing due time.
+      this.run(`UPDATE outbox SET state='pending',attempt=0,token=NULL,lease_ms=NULL,
+        next_ms=CASE WHEN state='pending' THEN next_ms ELSE ? END,code='route_changed'
+        WHERE state IN ('pending','running','paused') AND event_id IN
+        (SELECT e.event_id FROM events e JOIN watches w USING(watch_id) WHERE w.consumer_id=?)`,now,consumerId);
+    });
+  }
+
+  resumeDelivery(consumerId, now) {
+    return this.transaction(() => {
+      const route = this.one('SELECT paused FROM delivery_routes WHERE consumer_id=?',consumerId);
+      if (!route || !route.paused) return false;
+      this.run('UPDATE delivery_routes SET paused=0 WHERE consumer_id=?',consumerId);
+      this.run(`UPDATE outbox SET state='pending',attempt=0,token=NULL,lease_ms=NULL,next_ms=?,code='operator_resumed'
+        WHERE state='paused' AND event_id IN
+        (SELECT e.event_id FROM events e JOIN watches w USING(watch_id) WHERE w.consumer_id=?)`,now,consumerId);
+      return true;
+    });
+  }
+
+  claimDelivery(now, skipConsumers = []) {
     return this.transaction(() => {
       this.run(`UPDATE outbox SET state='dead',code='lease_expired',token=NULL,lease_ms=NULL
-        WHERE state='running' AND lease_ms<=? AND attempt>=?`,now,this.maxAttempts);
-      const row = this.one(`SELECT e.event_id,e.watch_id,e.sequence,e.body,w.consumer_id,o.attempt FROM outbox o
-        JOIN events e USING(event_id) JOIN watches w USING(watch_id)
+        WHERE state='running' AND lease_ms<=? AND attempt>=max_attempts`,now);
+      const consumerFilter = skipConsumers.length
+        ? `AND w.consumer_id NOT IN (${skipConsumers.map(() => '?').join(',')})` : '';
+      const row = this.one(`SELECT e.event_id,e.watch_id,e.sequence,e.body,w.consumer_id,o.attempt,r.fingerprint AS route_ref
+        FROM outbox o JOIN events e USING(event_id) JOIN watches w USING(watch_id) JOIN delivery_routes r USING(consumer_id)
         WHERE ((o.state='pending' AND o.next_ms<=?) OR (o.state='running' AND o.lease_ms<=?))
         AND NOT EXISTS (SELECT 1 FROM events p JOIN outbox prev USING(event_id)
           WHERE p.watch_id=e.watch_id AND p.sequence<e.sequence AND prev.state!='accepted')
-        ORDER BY o.next_ms,e.rowid LIMIT 1`,now,now);
+        AND r.paused=0 ${consumerFilter} ORDER BY o.next_ms,e.rowid LIMIT 1`,now,now,...skipConsumers);
       if (!row) return null;
       const token = randomUUID();
-      this.run(`UPDATE outbox SET state='running',attempt=attempt+1,token=?,lease_ms=?
-        WHERE event_id=?`,token,now+this.leaseMs,row.event_id);
+      this.run(`UPDATE outbox SET state='running',attempt=attempt+1,token=?,lease_ms=?,
+        max_attempts=CASE WHEN attempt=0 THEN ? ELSE max_attempts END,
+        retry_base_ms=CASE WHEN attempt=0 THEN ? ELSE retry_base_ms END,
+        retry_cap_ms=CASE WHEN attempt=0 THEN ? ELSE retry_cap_ms END WHERE event_id=?`,
+        token,now+this.leaseMs,this.maxAttempts,this.baseDelayMs,this.maxDelayMs,row.event_id);
       return {...row,attempt:row.attempt+1,token};
     });
   }
 
-  finishDelivery(claim, {accepted,code,now}) {
+  finishDelivery(claim, {accepted,code,now,retryAfterMs = 0}) {
     if (!deliveryCodes.has(code) || typeof accepted !== 'boolean' || !Number.isSafeInteger(now) ||
-        (code === 'accepted') !== accepted) throw Error('invalid_request');
-    const state = accepted ? 'accepted' : claim.attempt >= this.maxAttempts ? 'dead' : 'pending';
-    const delay = Math.min(this.maxDelayMs,this.baseDelayMs * 2 ** (claim.attempt-1));
+        !validBound(retryAfterMs,0,3600000) || (code === 'accepted') !== accepted) throw Error('invalid_request');
+    if (code === 'endpoint_gone') {
+      return this.transaction(() => {
+        const active = this.one(`SELECT w.consumer_id FROM outbox o JOIN events e USING(event_id) JOIN watches w USING(watch_id)
+          WHERE o.event_id=? AND o.state='running' AND o.token=?`,claim.event_id,claim.token);
+        if (!active) return false;
+        this.run('UPDATE delivery_routes SET paused=1 WHERE consumer_id=?',active.consumer_id);
+        this.run(`UPDATE outbox SET state='paused',token=NULL,lease_ms=NULL,code='endpoint_gone'
+          WHERE state IN ('running','pending') AND event_id IN
+          (SELECT e.event_id FROM events e JOIN watches w USING(watch_id) WHERE w.consumer_id=?)`,active.consumer_id);
+        return true;
+      });
+    }
+    if (code === 'route_changed') {
+      return this.run(`UPDATE outbox SET state='pending',attempt=0,token=NULL,lease_ms=NULL,next_ms=?,code=?
+        WHERE event_id=? AND state='running' AND token=?`,now,code,claim.event_id,claim.token).changes === 1;
+    }
+    const row = this.one(`SELECT attempt,max_attempts,retry_cap_ms,retry_base_ms FROM outbox
+      WHERE event_id=? AND state='running' AND token=?`,claim.event_id,claim.token);
+    if (!row) return false;
+    const state = accepted ? 'accepted' : row.attempt >= row.max_attempts ? 'dead' : 'pending';
+    const backoff = row.retry_base_ms * 2 ** (row.attempt-1);
+    const delay = Math.min(row.retry_cap_ms,Math.max(backoff,retryAfterMs));
     return this.run(`UPDATE outbox SET state=?,next_ms=?,code=?,token=NULL,lease_ms=NULL
       WHERE event_id=? AND state='running' AND token=?`,state,now+delay,code,claim.event_id,claim.token).changes === 1;
   }

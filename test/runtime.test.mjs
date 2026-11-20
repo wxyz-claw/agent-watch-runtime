@@ -5,6 +5,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
+import { createServer } from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
 import { WatchRuntime } from '../src/runtime.mjs';
 import { WatchStore } from '../src/store.mjs';
@@ -209,7 +210,8 @@ test('persistent retry limits leave a visible dead letter and fence stale acknow
   assert.notEqual(second.token,first.token);
   assert.equal(h.store.finishDelivery(first,{accepted:true,code:'accepted',now:h.now()}),false);
   assert.equal(h.store.finishDelivery(second,{accepted:false,code:'route_unavailable',now:h.now()}),true);
-  assert.deepEqual(h.rt.get(watch_id).dead_letter,{code:'route_unavailable',sequence:1});
+  assert.deepEqual(h.rt.get(watch_id).dead_letter,
+    {code:'route_unavailable',event_id:first.event_id,sequence:1,attempt:2,max_attempts:2});
   assert.equal(h.store.claimDelivery(h.now()+1000),null);
 });
 
@@ -248,4 +250,202 @@ test('watch store declines an unrelated SQLite file',async t => {
   assert.throws(() => new WatchStore(path),/store_error/);
   assert.deepEqual(db.prepare("SELECT name FROM sqlite_schema WHERE type='table'").all().map(r => r.name),['fixture']);
   db.close();
+});
+
+test('matching upstream replay can advance its continuation without appending an event',async t => {
+  const h = await environment(t,async ({checkpoint}) => {
+    if (checkpoint.cursor === null) return {...event('a',1),cursor:'first-position'};
+    if (checkpoint.cursor === 'first-position') return {...event('a',1),cursor:'second-position'};
+    return {...event('b',2),cursor:'third-position'};
+  });
+  const {watch_id} = await h.rt.create('emitted',request);
+  h.advance(20); await h.rt.tick();
+  assert.equal(h.rt.get(watch_id).sequence,1);
+  await h.reopen(); h.advance(20); await h.rt.tick();
+  assert.deepEqual(events(h.store,watch_id).map(item => item.sequence),[1,2]);
+});
+
+test('read-only history resumes from an exclusive per-watch sequence with no delivery side effects',async t => {
+  const h = await environment(t,null);
+  const {watch_id} = await h.rt.create('emitted',request);
+  const other = await h.rt.create('emitted',{...request,request_id:'other'});
+  h.rt.ingest('source',other.watch_id,event('different',0));
+  for (let n=1; n<=5; n++) h.rt.ingest('source',watch_id,event('occurrence-'+n,n));
+  const status = h.rt.get(watch_id);
+  const first = h.rt.history(watch_id,{limit:2});
+  assert.deepEqual(first.events.map(e => validateEvent(e).sequence),[1,2]);
+  assert.equal(first.has_more,true);
+  await h.reopen();
+  assert.deepEqual(h.rt.history(watch_id,{limit:2}),first);
+  const rest = h.rt.history(watch_id,{after_sequence:first.next_sequence});
+  assert.deepEqual(rest.events.map(e => e.sequence),[3,4,5]);
+  assert.equal(rest.has_more,false);
+  assert.deepEqual(h.rt.history(watch_id,{after_sequence:rest.next_sequence}),{events:[],has_more:false,next_sequence:5});
+  assert.deepEqual(h.rt.get(watch_id),status);
+  assert.throws(() => h.rt.history(watch_id,{limit:51}),/invalid_request/);
+});
+
+test('history pages respect the encoded size bound even for dense structural diffs',async t => {
+  const many = n => Object.fromEntries(Array.from({length:32},(_,i) => ['field'+i,n]));
+  const h = await environment(t,async ({checkpoint}) => ({
+    version:1,contract:'observe_change',coverage:'complete',authority:'authoritative',value:many(checkpoint.reads),
+  }));
+  const {watch_id} = await h.rt.create('changes',request);
+  for (let i=0;i<32;i++) { h.advance(20); await h.rt.tick(); }
+  const page = h.rt.history(watch_id,{limit:50});
+  assert.equal(page.has_more,true);
+  assert.ok(page.events.length>0 && page.events.length<32);
+  assert.ok(Buffer.byteLength(JSON.stringify(page))<65536);
+  assert.equal(h.rt.history(watch_id,{after_sequence:page.next_sequence}).events[0].sequence,page.next_sequence+1);
+});
+
+test('a delivery retains its first sender’s retry policy when process defaults change',async t => {
+  const options = {store:{maxAttempts:2,baseDelayMs:19,maxDelayMs:40}};
+  const h = await environment(t,[frame({phase:'ready'})],options);
+  const {watch_id} = await h.rt.create('until',until);
+  await deliverOnce(h.store,h.routes,{now:h.now});
+  options.store = {maxAttempts:8,baseDelayMs:1,maxDelayMs:1000};
+  await h.reopen();
+  assert.equal(await deliverOnce(h.store,h.routes,{now:h.now}),null);
+  const status = h.rt.get(watch_id);
+  assert.equal(status.delivery_head.max_attempts,2);
+  assert.equal(status.delivery_head.next_ms,h.now()+19);
+  h.advance(19); await deliverOnce(h.store,h.routes,{now:h.now});
+  assert.equal(h.rt.get(watch_id).dead_letter.attempt,2);
+});
+
+test('v1 store upgrades preserve existing immutable bytes and seed durable retry policy',async t => {
+  const h = await environment(t,[frame({phase:'ready'})]);
+  const {watch_id} = await h.rt.create('until',until);
+  const original = events(h.store,watch_id);
+  h.store.db.exec(`ALTER TABLE outbox DROP COLUMN max_attempts; ALTER TABLE outbox DROP COLUMN retry_base_ms;
+    ALTER TABLE outbox DROP COLUMN retry_cap_ms; DROP TABLE delivery_routes; PRAGMA user_version=1;`);
+  await h.reopen();
+  assert.equal(h.store.one('PRAGMA user_version').user_version,3);
+  assert.deepEqual(events(h.store,watch_id),original);
+  assert.equal(h.rt.get(watch_id).delivery_head.max_attempts,6);
+});
+
+test('one slow consumer leaves a delivery slot for another consumer',async t => {
+  const h = await environment(t,[frame({phase:'ready'})],{runtime:{parallelism:2,deliveryTimeoutMs:1000}});
+  let received;
+  const arrival = new Promise(resolve => { received = resolve; });
+  const slow = createServer((req,res) => { req.resume(); received(res); });
+  slow.listen(0,'127.0.0.1'); await once(slow,'listening');
+  t.after(() => { slow.closeAllConnections(); return new Promise(resolve => slow.close(resolve)); });
+  h.routes.set('worker',{url:'http://127.0.0.1:'+slow.address().port+'/inbox',keyId:'fixture',key:randomBytes(32)});
+  h.routes.set('other',{});
+  await h.rt.create('until',until);
+  const waiting = await h.rt.create('until',{...until,request_id:'next'});
+  const independent = await h.rt.create('until',{...until,consumer_id:'other'});
+  const pulse = h.rt.tick();
+  const response = await arrival;
+  try {
+    assert.equal(h.rt.get(waiting.watch_id).delivery_head.attempt,0);
+    assert.equal(h.rt.get(independent.watch_id).delivery_head.code,'route_unavailable');
+  } finally { response.writeHead(503).end(); await pulse; }
+});
+
+async function peer(t, handler) {
+  const server = createServer(handler);
+  server.listen(0,'127.0.0.1'); await once(server,'listening');
+  t.after(() => {
+    server.closeAllConnections();
+    return new Promise(resolve => server.close(resolve));
+  });
+  return {url:'http://127.0.0.1:'+server.address().port+'/inbox',keyId:'fixture',key:randomBytes(32)};
+}
+
+test('429 Retry-After sets a durable bounded minimum delay from the sender clock',async t => {
+  const h = await environment(t,[frame({phase:'ready'})],{store:{baseDelayMs:5,maxDelayMs:2500}});
+  let requests = 0;
+  const route = await peer(t,(req,res) => {
+    req.resume(); requests++;
+    res.writeHead(429,{'Retry-After':requests === 1 ? '2' : '60'}).end();
+  });
+  h.routes.set('worker',route);
+  const {watch_id} = await h.rt.create('until',until);
+  assert.equal((await deliverOnce(h.store,h.routes,{now:h.now})).code,'rate_limited');
+  assert.equal(h.rt.get(watch_id).delivery_head.next_ms,h.now()+2000);
+  await h.reopen(); h.advance(1999);
+  assert.equal(await deliverOnce(h.store,h.routes,{now:h.now}),null);
+  h.advance(1); await deliverOnce(h.store,h.routes,{now:h.now});
+  assert.equal(requests,2);
+  assert.equal(h.rt.get(watch_id).delivery_head.next_ms,h.now()+2500);
+});
+
+test('a current 410 pauses the logical route across restart until operator repair',async t => {
+  const h = await environment(t,[frame({phase:'ready'})],{store:{maxAttempts:1}});
+  let requests = 0;
+  const bodies = [];
+  const route = await peer(t,async (req,res) => {
+    const chunks = []; for await (const chunk of req) chunks.push(chunk);
+    bodies.push(Buffer.concat(chunks));
+    res.writeHead(++requests === 1 ? 410 : 503).end();
+  });
+  h.routes.set('worker',route);
+  const first = await h.rt.create('until',until);
+  await deliverOnce(h.store,h.routes,{now:h.now});
+  assert.equal(h.rt.get(first.watch_id).delivery_paused,true);
+  assert.equal(h.rt.get(first.watch_id).delivery_head.state,'paused');
+  const later = await h.rt.create('until',{...until,request_id:'same-consumer'});
+  assert.equal(later.delivery.paused,1);
+  await h.reopen(); h.advance(100000);
+  assert.equal(await deliverOnce(h.store,h.routes,{now:h.now}),null);
+  assert.equal(requests,1);
+  assert.equal(h.rt.resumeDelivery('worker'),true);
+  assert.equal(h.rt.resumeDelivery('worker'),false);
+  await deliverOnce(h.store,h.routes,{now:h.now});
+  assert.deepEqual(bodies[1],bodies[0]);
+  assert.equal(h.rt.get(first.watch_id).dead_letter.code,'http_rejected');
+});
+
+test('a rotated route fences a late 410 even on the final attempt and delivers the original bytes',async t => {
+  const h = await environment(t,[frame({phase:'ready'})],{store:{maxAttempts:1}});
+  let arrived;
+  const waiting = new Promise(resolve => { arrived = resolve; });
+  const old = await peer(t,async (req,res) => {
+    const chunks=[]; for await (const chunk of req) chunks.push(chunk);
+    arrived({res,bytes:Buffer.concat(chunks)});
+  });
+  const inbox = new Inbox(join(h.dir,'accepted.sqlite')); t.after(() => inbox.close());
+  const key = randomBytes(32);
+  const current = createReceiver({inbox,consumerId:'worker',keys:new Map([['next',key]]),now:h.now});
+  current.listen(0,'127.0.0.1'); await once(current,'listening');
+  t.after(() => new Promise(resolve => current.close(resolve)));
+  h.routes.set('worker',old);
+  const {watch_id} = await h.rt.create('until',until);
+  const late = deliverOnce(h.store,h.routes,{now:h.now});
+  const retiring = await waiting;
+  h.routes.set('worker',{url:'http://127.0.0.1:'+current.address().port+'/inbox',keyId:'next',key});
+  retiring.res.writeHead(410).end();
+  assert.equal((await late).code,'route_changed');
+  assert.equal(h.rt.get(watch_id).delivery_paused,false);
+  const pending = h.rt.get(watch_id).delivery_head;
+  assert.deepEqual([pending.state,pending.attempt],['pending',0]);
+  await h.reopen();
+  const retry = await deliverOnce(h.store,h.routes,{now:h.now});
+  assert.equal(retry.accepted,true);
+  const original = JSON.parse(retiring.bytes);
+  assert.equal(retry.event_id,original.event_id);
+  assert.equal(inbox.status('worker',retry.event_id).digest,original.digest);
+  assert.equal(h.rt.get(watch_id).sequence,1);
+});
+
+test('a new destination repairs a persisted 410 pause and a stale token cannot pause it again',async t => {
+  const h = await environment(t,[frame({phase:'ready'})],{store:{maxAttempts:1}});
+  const {watch_id} = await h.rt.create('until',until);
+  const old = await peer(t,(req,res) => { req.resume(); res.writeHead(410).end(); });
+  h.routes.set('worker',old);
+  await deliverOnce(h.store,h.routes,{now:h.now});
+  assert.equal(h.rt.get(watch_id).delivery_head.state,'paused');
+  await h.reopen();
+  const replacement = await peer(t,(req,res) => { req.resume(); res.writeHead(429,{'Retry-After':'1'}).end(); });
+  h.routes.set('worker',replacement);
+  const attempt = await deliverOnce(h.store,h.routes,{now:h.now});
+  assert.equal(attempt.code,'rate_limited');
+  assert.equal(h.rt.get(watch_id).delivery_paused,false);
+  assert.equal(h.store.finishDelivery({event_id:attempt.event_id,token:'retired'},
+    {accepted:false,code:'endpoint_gone',now:h.now()}),false);
+  assert.equal(h.rt.get(watch_id).delivery_paused,false);
 });

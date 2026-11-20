@@ -7,6 +7,7 @@ const APP_ID = 0x41574942;
 const MAX_REPLY_BYTES = 4096;
 const MAX_SKEW_MS = 300_000;
 const MAX_RETRY_MS = 60_000;
+const MAX_RETRY_HINT_MS = 3_600_000;
 const ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 const ROUTE = /^http:\/\/127\.0\.0\.1:([1-9]\d{0,4})\/inbox$/;
 const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
@@ -29,6 +30,35 @@ function validKey(key) {
   return Buffer.isBuffer(key) && key.length >= 32 && key.length <= 256;
 }
 
+function resolveRoute(routes, consumer) {
+  try {
+    const { url, keyId, key } = routes.get(consumer) ?? {};
+    const match = typeof url === 'string' && ROUTE.exec(url);
+    if (!match || Number(match[1]) > 65535 || !safeId(consumer) || !safeId(keyId) || !validKey(key)) return null;
+    const secret = Buffer.from(key);
+    const fingerprint = createHmac('sha256', secret)
+      .update(`agent-watch-route-v1\n${consumer}\n${url}\n${keyId}\n`).digest('hex');
+    const snapshot = { port: Number(match[1]), keyId, fingerprint };
+    Object.defineProperty(snapshot, 'key', { get: () => Buffer.from(secret) });
+    return Object.freeze(snapshot);
+  } catch {
+    // Configuration can be supplied by a getter backed by a changing local contact file.
+    return null;
+  }
+}
+
+/** Reconcile logical consumers before selecting work, including paused deliveries. */
+export function syncDeliveryRoutes(store, routes, now = Date.now) {
+  const time = instant(now);
+  const snapshots = new Map();
+  for (const consumer of routes.keys()) {
+    const snapshot = resolveRoute(routes, consumer);
+    snapshots.set(consumer, snapshot);
+    if (snapshot) store.syncRoute?.(consumer, snapshot.fingerprint, time);
+  }
+  return snapshots;
+}
+
 function mac(key, consumer, keyId, timestamp, body) {
   const prefix = `agent-watch-webhook-v1\n${consumer}\n${keyId}\n${timestamp}\n`;
   return createHmac('sha256', key).update(prefix).update(body).digest();
@@ -39,54 +69,102 @@ function parseEvent(body) {
   return validateEvent(JSON.parse(utf8.decode(body)));
 }
 
+// Normalize the two historical HTTP-date forms to IMF-fixdate, then round-trip
+// the calendar fields and weekday. Date.parse alone accepts unrelated strings.
+function parseHttpDate(value, now) {
+  let normalized = value;
+  const rfc850 = /^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), (\d{2})-([A-Z][a-z]{2})-(\d{2}) (\d{2}:\d{2}:\d{2}) GMT$/.exec(value);
+  const asctime = /^([A-Z][a-z]{2}) ([A-Z][a-z]{2}) ( [1-9]|\d{2}) (\d{2}:\d{2}:\d{2}) (\d{4})$/.exec(value);
+  if (rfc850) {
+    const [, weekday, day, month, shortYear, time] = rfc850;
+    const cutoff = new Date(now);
+    cutoff.setUTCFullYear(cutoff.getUTCFullYear() + 50);
+    const latestYear = cutoff.getUTCFullYear();
+    let year = latestYear - (latestYear - Number(shortYear)) % 100;
+    if (Date.parse(`${day} ${month} ${year} ${time} GMT`) > cutoff.getTime()) year -= 100;
+    normalized = `${weekday.slice(0, 3)}, ${day} ${month} ${year} ${time} GMT`;
+  } else if (asctime) {
+    const [, weekday, month, day, time, year] = asctime;
+    normalized = `${weekday}, ${day.replace(' ', '0')} ${month} ${year} ${time} GMT`;
+  }
+  if (normalized.length !== 29) return NaN;
+  const timestamp = Date.parse(normalized);
+  return Number.isFinite(timestamp) && new Date(timestamp).toUTCString() === normalized ? timestamp : NaN;
+}
+
+function retryDelay(value, now) {
+  if (typeof value !== 'string') return undefined;
+  if (/^\d+$/.test(value)) return Math.min(MAX_RETRY_HINT_MS, Number(value) * 1000);
+  const timestamp = parseHttpDate(value, now);
+  if (Number.isFinite(timestamp)) return Math.min(MAX_RETRY_HINT_MS, Math.max(0, timestamp - now));
+}
+
+function classifyReply(response, now) {
+  if (response.code) return response;
+  if (response.status >= 200 && response.status < 300) return { code: 'accepted' };
+  if (response.status === 410) return { code: 'endpoint_gone' };
+  if (response.status === 429 || response.status === 503) {
+    const retryAfterMs = retryDelay(response.retryAfter, now);
+    if (retryAfterMs !== undefined) return { code: 'rate_limited', retryAfterMs };
+    if (response.status === 429) return { code: 'rate_limited' };
+  }
+  return { code: 'http_rejected' };
+}
+
 function post(port, body, headers, timeoutMs) {
   return new Promise(resolve => {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     let completed = false;
-    function finish(code) {
+    function finish(outcome) {
       if (completed) return;
       completed = true;
       clearTimeout(timeout);
-      resolve(code);
+      resolve(outcome);
     }
     const req = request({
       hostname: '127.0.0.1', port, path: '/inbox', method: 'POST', agent: false,
       headers, signal: controller.signal, maxHeaderSize: 4096,
     }, res => {
+      const reply = { status: res.statusCode, retryAfter: header(res, 'retry-after') };
+      const interrupted = () => finish({ code: controller.signal.aborted ? 'delivery_timeout' : 'transport_error' });
+      res.on('aborted', interrupted);
+      res.on('error', interrupted);
+      if (res.statusCode >= 300) {
+        // The status and retry policy are complete in the headers. Discard diagnostic bodies.
+        finish(reply);
+        res.destroy();
+        return;
+      }
       let size = 0;
       res.on('data', chunk => {
         size += chunk.length;
         if (size > MAX_REPLY_BYTES) {
-          finish('response_too_large');
+          finish({ code: 'response_too_large' });
           res.destroy();
         }
       });
-      const interrupted = () => finish(controller.signal.aborted ? 'delivery_timeout' : 'transport_error');
-      res.on('aborted', interrupted);
-      res.on('error', interrupted);
-      res.on('end', () => {
-        const success = res.statusCode >= 200 && res.statusCode < 300;
-        finish(success ? 'accepted' : 'http_rejected');
-      });
+      res.on('end', () => finish(reply));
     });
-    req.on('error', () => finish(controller.signal.aborted ? 'delivery_timeout' : 'transport_error'));
+    req.on('error', () => finish({ code: controller.signal.aborted ? 'delivery_timeout' : 'transport_error' }));
     req.end(body);
   });
 }
 
 /** Claim one immutable envelope, resolving the current route and key on each attempt. */
-export async function deliverOnce(store, routes, { now = Date.now, timeoutMs = 3000 } = {}) {
+export async function deliverOnce(store, routes, { now = Date.now, timeoutMs = 3000, claim: acquired, snapshots } = {}) {
   if (!integer(timeoutMs, 1, 30_000)) throw new Error('invalid_timeout');
   const started = instant(now);
-  const claim = store.claimDelivery(started);
+  snapshots ??= syncDeliveryRoutes(store, routes, started);
+  const claim = acquired ?? store.claimDelivery(started);
   if (!claim) return null;
 
-  const route = routes.get(claim.consumer_id);
-  const match = typeof route?.url === 'string' && ROUTE.exec(route.url);
-  let code = 'route_unavailable';
-  if (match && Number(match[1]) <= 65535 && safeId(claim.consumer_id) &&
-      safeId(route.keyId) && validKey(route.key)) {
+  const route = snapshots.get(claim.consumer_id);
+  let outcome = { code: 'route_unavailable' };
+  let response;
+  if (route && Object.hasOwn(claim, 'route_ref') && claim.route_ref !== route.fingerprint) {
+    outcome = { code: 'route_changed' };
+  } else if (route) {
     let body;
     try {
       if (typeof claim.body !== 'string' && !(claim.body instanceof Uint8Array)) {
@@ -99,11 +177,11 @@ export async function deliverOnce(store, routes, { now = Date.now, timeoutMs = 3
           event.sequence !== claim.sequence) throw new Error('invalid_event');
       body = bytes;
     } catch {
-      code = 'invalid_event';
+      outcome = { code: 'invalid_event' };
     }
     if (body) {
       const timestamp = String(started);
-      code = await post(Number(match[1]), body, {
+      response = await post(route.port, body, {
         'content-type': 'application/json',
         'content-length': body.length,
         'x-watch-consumer': claim.consumer_id,
@@ -113,9 +191,19 @@ export async function deliverOnce(store, routes, { now = Date.now, timeoutMs = 3
       }, timeoutMs);
     }
   }
-  const accepted = code === 'accepted';
-  const recorded = store.finishDelivery(claim, { accepted, code, now: instant(now) }) !== false;
-  return { event_id: claim.event_id, consumer_id: claim.consumer_id, accepted, recorded, code };
+  const finished = instant(now);
+  if (response) {
+    const current = resolveRoute(routes, claim.consumer_id);
+    if (current?.fingerprint === route.fingerprint) {
+      outcome = classifyReply(response, finished);
+    } else {
+      if (current) store.syncRoute?.(claim.consumer_id, current.fingerprint, finished);
+      outcome = { code: 'route_changed' };
+    }
+  }
+  const accepted = outcome.code === 'accepted';
+  const recorded = store.finishDelivery(claim, { accepted, ...outcome, now: finished }) !== false;
+  return { event_id: claim.event_id, consumer_id: claim.consumer_id, accepted, recorded, ...outcome };
 }
 
 const PREDECESSOR_DONE = `(

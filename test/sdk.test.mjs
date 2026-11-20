@@ -148,6 +148,23 @@ test('truncated path summaries retain complete endpoint digests', () => {
   assert.ok(sealEvent({ ...fields, evidence: { diff: escapedSummary } }));
 });
 
+test('boundary-size generated snapshots produce deliverable envelopes for every pair', () => {
+  const key = '~'.repeat(65_528);
+  const fixtures = [
+    null, true, 12, 'x'.repeat(65_534), [], Array(8_191).fill(0), { [key]: 1 }, { [key]: 2 },
+    Object.fromEntries(Array.from({ length: 48 }, (_, i) => ['group/' + i, { state: i }])),
+  ];
+  for (const before of fixtures) {
+    for (const after of fixtures) {
+      const { value } = normalizeObservation({ ...snapshot, value: after });
+      const diff = diffEvidence(before, value);
+      const event = sealEvent({ ...fields, kind: 'changed', evidence: { diff, source_digest: digest(value) } });
+      assert.ok(Buffer.byteLength(JSON.stringify(event)) <= MAX_EVENT_BYTES);
+      assert.deepEqual(validateEvent(event), event);
+    }
+  }
+});
+
 test('an event envelope binds identity, ordering, observation time, event kind, and evidence to its digest', () => {
   const event = sealEvent(fields);
   assert.equal(event.digest, eventDigest);

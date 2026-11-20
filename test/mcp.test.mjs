@@ -62,7 +62,7 @@ test('tools become available after negotiated initialization and a client notifi
   assert.deepEqual(results.map(x => x.id), [0, 1, 1, 2, 3, 4, 5]);
   assert.deepEqual(results.slice(0, 4).map(x => x.error?.code), [-32002, -32602, undefined, -32002]);
   const list = results[4].result.tools;
-  assert.deepEqual(list.map(x => x.name), ['watch_until', 'watch_changes', 'watch_emitted', 'get_watch', 'cancel_watch']);
+  assert.deepEqual(list.map(x => x.name), ['watch_until', 'watch_changes', 'watch_emitted', 'get_watch', 'cancel_watch', 'read_events']);
   assert.ok(list.every(tool => tool.inputSchema.additionalProperties === false));
   assert.deepEqual(list[0].inputSchema.required, ['source_id', 'consumer_id', 'request_id', 'predicate']);
   assert.deepEqual(list[0].inputSchema.properties.predicate.oneOf, [{ required: ['equals'] }, { required: ['contains'] }]);
@@ -132,6 +132,36 @@ test('runtime failures yield only fixed diagnostic codes', async () => {
   ])], runtime);
   assert.deepEqual(results.slice(1).map(r => r.result.structuredContent.error), ['watch_not_found', 'capacity', 'store_error']);
   assert.ok(!JSON.stringify(results).includes('synthetic-private-detail'));
+});
+
+test('history applies defaults, validates cursors and supports repeated read-only pages', async () => {
+  const trace = [];
+  const events = [{ sequence: 1 }, { sequence: 2 }, { sequence: 3 }];
+  const runtime = {
+    history(id, { after_sequence, limit }) {
+      trace.push([id, after_sequence, limit]);
+      const remaining = events.filter(e => e.sequence > after_sequence);
+      const page = remaining.slice(0, limit);
+      return { events: page, has_more: page.length < remaining.length, next_sequence: page.at(-1)?.sequence ?? after_sequence };
+    },
+  };
+  const read = (id, extra = {}) => call(id, 'read_events', { watch_id: 'watch-1', ...extra });
+  const replies = await exchange([encode([
+    ...initialize(), read(2), read(3, { limit: 1 }), read(4, { after_sequence: 1, limit: 1 }),
+    read(5, { after_sequence: 1, limit: 1 }), read(6, { after_sequence: 3 }),
+    read(7, { after_sequence: -1 }), read(8, { after_sequence: 1.5 }), read(9, { limit: 0 }),
+    read(10, { limit: 51 }), read(11, { acknowledge: true }),
+  ])], runtime);
+  assert.deepEqual(trace, [
+    ['watch-1', 0, 20], ['watch-1', 0, 1], ['watch-1', 1, 1], ['watch-1', 1, 1], ['watch-1', 3, 20],
+  ]);
+  const pages = replies.slice(1, 6).map(r => r.result.structuredContent);
+  assert.deepEqual(pages[0], { events, next_sequence: 3, has_more: false });
+  assert.deepEqual(pages[1], { events: [events[0]], next_sequence: 1, has_more: true });
+  assert.deepEqual(pages[2], { events: [events[1]], next_sequence: 2, has_more: true });
+  assert.deepEqual(pages[3], pages[2]);
+  assert.deepEqual(pages[4], { events: [], next_sequence: 3, has_more: false });
+  assert.ok(replies.slice(6).every(r => r.result.isError && r.result.structuredContent.error === 'invalid_request'));
 });
 
 test('preserves split UTF-8 and rejects oversized, malformed and unterminated frames without losing the next request', async () => {

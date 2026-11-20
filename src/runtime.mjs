@@ -1,5 +1,5 @@
 import { normalizeObservation, validatePredicate } from './sdk.mjs';
-import { deliverOnce } from './delivery.mjs';
+import { deliverOnce, syncDeliveryRoutes } from './delivery.mjs';
 
 const contracts = Object.freeze({until:'durable_ready', changes:'observe_change', emitted:'source_emitted'});
 const fields = new Set(['source_id','consumer_id','request_id','deadline_ms','interval_ms','predicate']);
@@ -23,6 +23,7 @@ export class WatchRuntime {
     for (const name of routes.keys()) if (!isId(name)) throw Error('invalid_request');
     Object.assign(this,{store,sources,routes,now,collectTimeoutMs,deliveryTimeoutMs,intervalMs,parallelism});
     this.busySources = new Set();
+    this.busyConsumers = new Set();
     this.abandoned = new Map();
     this.reads = new Set();
     this.sends = new Set();
@@ -75,6 +76,16 @@ export class WatchRuntime {
     return this.store.cancel(watchId,this.now());
   }
 
+  history(watchId, options) {
+    if (!isId(watchId)) throw Error('invalid_request');
+    return this.store.history(watchId,options);
+  }
+
+  resumeDelivery(consumerId) {
+    if (!this.routes.has(consumerId)) throw Error('consumer_not_found');
+    return this.store.resumeDelivery(consumerId,this.now());
+  }
+
   // Trusted in-process source entry point. A null reader registers an event-driven source.
   ingest(sourceId, watchId, observation) {
     if (!this.sources.has(sourceId) || this.sources.get(sourceId) !== null) throw Error('source_not_found');
@@ -91,7 +102,7 @@ export class WatchRuntime {
 
   normalize(mode, observation) {
     try { return normalizeObservation(observation,contracts[mode]); }
-    catch { return unavailable(mode,'invalid_observation'); }
+    catch (err) { return unavailable(mode,err?.code === 'unsupported_contract' ? 'unsupported_contract' : 'invalid_observation'); }
   }
 
   async sample(claim) {
@@ -142,10 +153,13 @@ export class WatchRuntime {
       if (!claim) break;
       started.push(this.launchRead(claim));
     }
-    const sendSlots = this.parallelism - this.sends.size;
-    for (let slot = 0; slot < sendSlots; slot++) {
-      const task = deliverOnce(this.store,this.routes,{now:this.now,timeoutMs:this.deliveryTimeoutMs})
-        .finally(() => this.sends.delete(task));
+    const snapshots = syncDeliveryRoutes(this.store,this.routes,now);
+    while (this.sends.size < this.parallelism) {
+      const claim = this.store.claimDelivery(now,[...this.busyConsumers]);
+      if (!claim) break;
+      this.busyConsumers.add(claim.consumer_id);
+      const task = deliverOnce(this.store,this.routes,{now:this.now,timeoutMs:this.deliveryTimeoutMs,claim,snapshots})
+        .finally(() => { this.busyConsumers.delete(claim.consumer_id); this.sends.delete(task); });
       this.sends.add(task);
       started.push(task);
     }
