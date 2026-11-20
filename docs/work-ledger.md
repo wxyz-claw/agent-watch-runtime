@@ -24,9 +24,18 @@ npm run demo
 
 Local verification on macOS ARM64 covered Node 22.13.0, 24.18.0 and 26.0.0. The optional upstream handler check uses a disposable Python environment and generated local watch history. Its dependencies are outside the Node runtime and package installation.
 
+## Host and installation evidence
+
+| Revision | Check | Observed result |
+| --- | --- | --- |
+| Public baseline `a0ca92dfb61d5e7c8637b853460923dcf082df92` | Anonymous Git fetch, then local packing and offline tarball installation | All 28 packaged files matched the pinned Git contents. |
+| Same baseline | Codex CLI 0.162.1 app-server guest session, unrelated working directory, absolute Node, script and state paths | The host listed all six baseline tools through `mcpServerStatus/list`. It called `watch_until` and `get_watch` through `mcpServer/tool/call` and observed `FALSE` at sequence 0. The host and stdio server then exited. |
+| Same baseline | Detached worker and loopback receiver after host exit | Updating the generated JSON fixture produced one signed acceptance and one completed job on its first attempt. |
+| Lifecycle candidate | Installed package with a stdio protocol fixture in a separate working directory | The fixture discovered 13 tools and created a v1 watch. The native control suite also exercises pause, resume, update and manual checks across restart. |
+
 ## Remaining work
 
-- An MCP client compatibility matrix for optional resource/subscription notifications remains open. Current clients need stdio tools and the configured webhook receiver.
+- Named-host coverage for the added lifecycle tools, authenticated model turns, automatic host wake and optional resource/subscription notifications remain unverified. Current delivery uses the configured webhook receiver.
 - Multi-host transport, key provisioning across hosts, downstream external effects and operator-driven dead-letter reconciliation require separate deployment designs. The delivered transport is local HTTP with HMAC.
 - Data retention currently uses visible hard limits. Automatic receipt pruning would require a replay horizon agreed by sender and receiver. Cross-watch ordering and global replay are outside the v1 contract.
 - The aggregate workflow requires its first hosted run on the lifecycle revision. Its result checker has local tests covering successful, missing, skipped, canceled and failed jobs.

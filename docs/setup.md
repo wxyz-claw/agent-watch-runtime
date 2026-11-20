@@ -65,7 +65,7 @@ Keep the receiver running. Supply this launch record to the MCP client's stdio p
 }
 ```
 
-The client can start in a directory outside the checkout and consumer project. Protocol fixtures exercise `initialize`, `notifications/initialized`, `tools/list` and `tools/call` over newline-delimited JSON-RPC. The suite checks protocol revisions `2025-11-25` and `2025-06-18`. The [verification ledger](work-ledger.md) tracks named client compatibility.
+The client can start in a directory outside the checkout and consumer project. Protocol fixtures exercise `initialize`, `notifications/initialized`, `tools/list` and `tools/call` over newline-delimited JSON-RPC. The suite checks protocol revisions `2025-11-25` and `2025-06-18`. On baseline `a0ca92d`, a Codex CLI 0.162.1 app-server guest session launched from an unrelated working directory discovered all six baseline tools and called `watch_until` and `get_watch`. After the host exited, a fixture change produced a signed acceptance and a completed job. [Host and installation evidence](work-ledger.md#host-and-installation-evidence)
 
 ## Run separate processes
 
