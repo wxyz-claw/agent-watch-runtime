@@ -1,7 +1,27 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { canonical, digest, diffEvidence, evaluatePredicate, isAuthoritativeObservation, sealEvent } from './sdk.mjs';
 
+import { configSummary, normalizeConfig } from './configuration.mjs';
+
+const openStates = new Set(['active', 'paused']);
+const listedStates = new Set([...openStates, 'ready', 'canceled', 'deadline', 'error']);
+const manualFields = 'watch_id,operation_seq,revision,state,requested_ms,completed_ms,truth,coverage,code';
+const controlsSchema = `
+  CREATE TABLE watch_configs (
+    watch_id TEXT PRIMARY KEY REFERENCES watches(watch_id), config TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1 CHECK(revision>0),
+    delivery_enabled INTEGER GENERATED ALWAYS AS (json_extract(config,'$.delivery.enabled')) VIRTUAL
+  );
+  CREATE TABLE manual_checks (
+    watch_id TEXT PRIMARY KEY REFERENCES watches(watch_id), operation_seq INTEGER NOT NULL,
+    revision INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('queued','running','completed','superseded')),
+    token TEXT, requested_ms INTEGER NOT NULL, completed_ms INTEGER, truth TEXT, coverage TEXT, code TEXT
+  );
+  ALTER TABLE outbox ADD COLUMN retry_jitter_ms INTEGER NOT NULL DEFAULT 0;
+  INSERT INTO watch_configs(watch_id,config) SELECT watch_id,
+    json_set(json_remove(definition,'$.request_id'),'$.version',1,'$.delivery',json('{"enabled":true}')) FROM watches;
+`;
 const APP_ID = 0x41575231;
 const deliveryCodes = new Set(['accepted', 'route_unavailable', 'invalid_event', 'delivery_timeout',
   'transport_error', 'response_too_large', 'http_rejected', 'endpoint_gone', 'rate_limited', 'route_changed']);
@@ -41,20 +61,20 @@ function validBound(n, min, max) {
 
 export class WatchStore {
   constructor(path, {maxWatches = 512, maxEventsPerWatch = 1024, maxAttempts = 6,
-    leaseMs = 10000, baseDelayMs = 250, maxDelayMs = 60000} = {}) {
+    leaseMs = 10000, baseDelayMs = 250, maxDelayMs = 60000, retryJitterMs = 0} = {}) {
     if (!validBound(maxWatches, 1, 10000) || !validBound(maxEventsPerWatch, 2, 10000) ||
-        !validBound(maxAttempts, 1, 32) || !validBound(leaseMs, 1, 600000) ||
+        !validBound(retryJitterMs, 0, 60000) || !validBound(maxAttempts, 1, 32) || !validBound(leaseMs, 1, 600000) ||
         !validBound(baseDelayMs, 1, 600000) || !validBound(maxDelayMs, baseDelayMs, 3600000)) {
       throw Error('invalid_request');
     }
-    Object.assign(this, {maxWatches,maxEventsPerWatch,maxAttempts,leaseMs,baseDelayMs,maxDelayMs});
+    Object.assign(this, {maxWatches,maxEventsPerWatch,maxAttempts,leaseMs,baseDelayMs,maxDelayMs,retryJitterMs});
     this.db = new DatabaseSync(path);
     try {
       this.db.exec('PRAGMA busy_timeout=2000');
       this.transaction(() => {
         const {application_id} = this.one('PRAGMA application_id');
         const {user_version} = this.one('PRAGMA user_version');
-        if (application_id === APP_ID && user_version === 3) return;
+        if (application_id === APP_ID && user_version === 4) return;
         if (application_id === APP_ID && [1,2].includes(user_version)) {
           if (user_version === 1) {
             this.db.exec(`ALTER TABLE outbox ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 6;
@@ -64,14 +84,15 @@ export class WatchStore {
           }
           this.db.exec(routeSchema);
           this.db.exec('INSERT INTO delivery_routes(consumer_id) SELECT DISTINCT consumer_id FROM watches');
-          this.db.exec('PRAGMA user_version=3');
-          return;
+        } else if (application_id === 0 && user_version === 0 && !this.one('SELECT name FROM sqlite_schema LIMIT 1')) {
+          this.db.exec(schema);
+          this.db.exec(routeSchema);
+          this.db.exec(`PRAGMA application_id=${APP_ID}`);
+        } else if (application_id !== APP_ID || user_version !== 3) {
+          throw Error('store_error');
         }
-        if (application_id || user_version || this.one('SELECT name FROM sqlite_schema LIMIT 1')) throw Error('store_error');
-        this.db.exec(schema);
-        this.db.exec(routeSchema);
-        this.db.exec(`PRAGMA application_id=${APP_ID}`);
-        this.db.exec('PRAGMA user_version=3');
+        this.db.exec(controlsSchema);
+        this.db.exec('PRAGMA user_version=4');
       });
       this.db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON');
     } catch {
@@ -84,8 +105,9 @@ export class WatchStore {
   one(sql, ...args) { return this.db.prepare(sql).get(...args); }
   run(sql, ...args) { return this.db.prepare(sql).run(...args); }
 
-  transaction(fn) {
-    this.db.exec('BEGIN IMMEDIATE');
+  transaction(fn, readOnly = false) {
+    this.db.exec(readOnly ? 'BEGIN' : 'BEGIN IMMEDIATE');
+    this.inTransaction = true;
     try {
       const result = fn();
       this.db.exec('COMMIT');
@@ -93,6 +115,8 @@ export class WatchStore {
     } catch (err) {
       this.db.exec('ROLLBACK');
       throw err;
+    } finally {
+      this.inTransaction = false;
     }
   }
 
@@ -110,13 +134,22 @@ export class WatchStore {
       this.run('INSERT OR IGNORE INTO delivery_routes(consumer_id) VALUES (?)',consumer_id);
       this.run(`INSERT INTO watches(watch_id,consumer_id,request_id,source_id,mode,definition,deadline_ms,interval_ms,next_read_ms)
         VALUES (?,?,?,?,?,?,?,?,?)`,watch_id,consumer_id,request_id,source_id,mode,encoded,deadline_ms,interval_ms,scheduled ? now : null);
+      const {request_id: _requestId,...fields} = definition;
+      this.run('INSERT INTO watch_configs(watch_id,config) VALUES (?,?)', watch_id, canonical(normalizeConfig({version:1,...fields})));
       return {watch_id, created:true};
     });
   }
 
   get(watchId) {
+    // The config revision, manual receipt and delivery counters describe one committed snapshot.
+    if (this.inTransaction) return this.readStatus(watchId);
+    return this.transaction(() => this.readStatus(watchId),true);
+  }
+
+  readStatus(watchId) {
     const row = this.one(`SELECT watch_id,source_id,consumer_id,mode,state,sequence,truth,coverage,authority,code,
-      next_read_ms,deadline_ms,json_extract(checkpoint,'$.reads') AS reads FROM watches WHERE watch_id=?`,watchId);
+      next_read_ms,deadline_ms,json_extract(checkpoint,'$.reads') AS reads,config,revision,delivery_enabled
+      FROM watches JOIN watch_configs USING(watch_id) WHERE watch_id=?`,watchId);
     if (!row) throw Error('watch_not_found');
     const delivery = {pending:0,running:0,accepted:0,dead:0};
     for (const item of this.db.prepare(`SELECT o.state,COUNT(*) AS n FROM outbox o JOIN events e USING(event_id)
@@ -126,8 +159,113 @@ export class WatchStore {
     const next = this.one(`SELECT e.event_id,e.sequence,o.state,o.attempt,o.max_attempts,o.next_ms,o.lease_ms,o.code
       FROM outbox o JOIN events e USING(event_id) WHERE e.watch_id=? AND o.state!='accepted' ORDER BY e.sequence LIMIT 1`,watchId);
     const route = this.one('SELECT paused FROM delivery_routes WHERE consumer_id=?',row.consumer_id);
-    return {...row,delivery,delivery_paused:route.paused === 1,delivery_head:next ? {...next} : null,
+    const {config,...status} = row;
+    return {...status,config_version:1,configuration:configSummary(JSON.parse(config)),delivery_enabled:Boolean(row.delivery_enabled),
+      manual_check:this.manualCheck(watchId),delivery,delivery_paused:route.paused === 1,delivery_head:next ? {...next} : null,
       dead_letter:failure ? {...failure} : null};
+  }
+
+  manualCheck(watchId) {
+    const row = this.one(`SELECT ${manualFields} FROM manual_checks WHERE watch_id=?`,watchId);
+    return row ? {...row} : null;
+  }
+
+  controlRow(watchId) {
+    const row = this.one(`SELECT w.*,c.config,c.revision FROM watches w JOIN watch_configs c USING(watch_id)
+      WHERE watch_id=?`,watchId);
+    if (!row) throw Error('watch_not_found');
+    return row;
+  }
+
+  list({after = '', limit = 20, state} = {}) {
+    if (typeof after !== 'string' || after.length > 128 || !validBound(limit,1,50) ||
+        (state !== undefined && !listedStates.has(state))) throw Error('invalid_request');
+    const where = state === undefined ? '' : 'AND state=?';
+    const args = state === undefined ? [after,limit+1] : [after,state,limit+1];
+    const rows = this.db.prepare(`SELECT watch_id,source_id,consumer_id,mode,state,sequence,truth,coverage,
+      authority,code,next_read_ms,deadline_ms,revision,delivery_enabled FROM watches JOIN watch_configs USING(watch_id)
+      WHERE watch_id>? ${where} ORDER BY watch_id LIMIT ?`).all(...args);
+    const has_more = rows.length > limit;
+    const watches = rows.slice(0,limit).map(row => ({...row,config_version:1,delivery_enabled:Boolean(row.delivery_enabled)}));
+    return {watches,has_more,next_cursor:has_more ? watches.at(-1).watch_id : null};
+  }
+
+  bump(watchId) {
+    this.run('UPDATE watch_configs SET revision=revision+1 WHERE watch_id=?',watchId);
+  }
+
+  supersede(watchId,now) {
+    this.run(`UPDATE manual_checks SET state='superseded',token=NULL,completed_ms=?,code='superseded'
+      WHERE watch_id=? AND state IN ('queued','running')`,now,watchId);
+  }
+
+  setPaused(watchId, revision, paused, scheduled, now) {
+    this.expire(now,watchId);
+    return this.transaction(() => {
+      const row = this.controlRow(watchId);
+      if (!openStates.has(row.state)) throw Error('watch_terminal');
+      if (row.revision !== revision) throw Error('revision_conflict');
+      const state = paused ? 'paused' : 'active';
+      if (row.state !== state) {
+        this.run(`UPDATE watches SET state=?, next_read_ms=?, collect_token=NULL,collect_until_ms=NULL
+          WHERE watch_id=?`,state,!paused && scheduled ? now : null,watchId);
+        this.supersede(watchId,now);
+        this.bump(watchId);
+      }
+      return this.get(watchId);
+    });
+  }
+
+  edit(watchId, revision, patch, scheduled, now) {
+    this.expire(now,watchId);
+    return this.transaction(() => {
+      const row = this.controlRow(watchId);
+      const changesObservation = ['predicate','interval_ms','deadline_ms'].some(key => Object.hasOwn(patch,key));
+      if (!openStates.has(row.state) && changesObservation) throw Error('watch_terminal');
+      if (row.revision !== revision) throw Error('revision_conflict');
+      const previous = JSON.parse(row.config);
+      const config = normalizeConfig({...previous,...patch});
+      if (canonical(config) === canonical(previous)) return this.get(watchId);
+      this.run('UPDATE watch_configs SET config=?,revision=revision+1 WHERE watch_id=?',canonical(config),watchId);
+      const predicateChanged = config.mode === 'until' && canonical(config.predicate) !== canonical(previous.predicate);
+      if (predicateChanged || config.interval_ms !== previous.interval_ms || config.deadline_ms !== previous.deadline_ms) {
+        const canSchedule = row.state === 'active' && scheduled;
+        const wasDue = row.next_read_ms !== null && row.next_read_ms <= now;
+        const due = predicateChanged || wasDue ? now :
+          config.interval_ms !== previous.interval_ms ? now + config.interval_ms : row.next_read_ms;
+        this.run(`UPDATE watches SET interval_ms=?,deadline_ms=?,next_read_ms=?,truth=?,
+          collect_token=NULL,collect_until_ms=NULL WHERE watch_id=?`,config.interval_ms,config.deadline_ms,
+          canSchedule ? due : null,predicateChanged ? 'UNKNOWN' : row.truth,watchId);
+        this.supersede(watchId,now);
+        if (config.deadline_ms !== null && config.deadline_ms <= now) this.terminal(row,'deadline','deadline_reached',now,false);
+      }
+      return this.get(watchId);
+    });
+  }
+
+  queueCheck(watchId, revision, seq, scheduled, now) {
+    // Expire before the command transaction so a rejected command cannot roll back a due deadline.
+    this.expire(now,watchId);
+    return this.transaction(() => {
+      const row = this.controlRow(watchId);
+      const previous = this.manualCheck(watchId);
+      if (seq === previous?.operation_seq) {
+        if (revision !== previous.revision) throw Error('revision_conflict');
+        return previous;
+      }
+      if (!openStates.has(row.state)) throw Error('watch_terminal');
+      if (revision !== row.revision) throw Error('revision_conflict');
+      if (row.state === 'paused') throw Error('watch_paused');
+      if (!scheduled) throw Error('unsupported_control');
+      if (seq !== (previous?.operation_seq ?? 0) + 1) throw Error('operation_conflict');
+      if (previous?.state === 'queued' || previous?.state === 'running') throw Error('check_pending');
+      this.run(`INSERT INTO manual_checks(watch_id,operation_seq,revision,state,requested_ms) VALUES (?,?,?,'queued',?)
+        ON CONFLICT(watch_id) DO UPDATE SET operation_seq=excluded.operation_seq, revision=excluded.revision,
+        requested_ms=excluded.requested_ms,state='queued',token=NULL,completed_ms=NULL,truth=NULL,coverage=NULL,code=NULL`,
+        watchId,seq,revision,now);
+      this.run('UPDATE watches SET next_read_ms=? WHERE watch_id=?',now,watchId);
+      return this.manualCheck(watchId);
+    });
   }
 
   history(watchId, {after_sequence = 0, limit = 20} = {}) {
@@ -165,7 +303,9 @@ export class WatchStore {
     this.run('UPDATE watches SET sequence=? WHERE watch_id=?',sequence,row.watch_id);
   }
 
-  terminal(row, kind, code, now) {
+  terminal(row, kind, code, now, bump = true) {
+    this.supersede(row.watch_id,now);
+    if (bump) this.bump(row.watch_id);
     this.append(row,kind,code ? {code} : {},now);
     this.run(`UPDATE watches SET state=?,code=?,next_read_ms=NULL,collect_token=NULL,collect_until_ms=NULL
       WHERE watch_id=?`,kind,code,row.watch_id);
@@ -175,7 +315,7 @@ export class WatchStore {
     return this.transaction(() => {
       const row = this.one('SELECT * FROM watches WHERE watch_id=?',watchId);
       if (!row) throw Error('watch_not_found');
-      if (row.state === 'active') {
+      if (openStates.has(row.state)) {
         if (row.deadline_ms !== null && now >= row.deadline_ms) this.terminal(row,'deadline','deadline_reached',now);
         else this.terminal(row,'canceled','canceled',now);
       }
@@ -186,8 +326,8 @@ export class WatchStore {
   expire(now, watchId = null) {
     return this.transaction(() => {
       const rows = watchId === null
-        ? this.db.prepare("SELECT * FROM watches WHERE state='active' AND deadline_ms<=? ORDER BY deadline_ms LIMIT 64").all(now)
-        : this.db.prepare("SELECT * FROM watches WHERE state='active' AND deadline_ms<=? AND watch_id=?").all(now,watchId);
+        ? this.db.prepare("SELECT * FROM watches WHERE state IN ('active','paused') AND deadline_ms<=? ORDER BY deadline_ms LIMIT 64").all(now)
+        : this.db.prepare("SELECT * FROM watches WHERE state IN ('active','paused') AND deadline_ms<=? AND watch_id=?").all(now,watchId);
       for (const row of rows) this.terminal(row,'deadline','deadline_reached',now);
       return rows.length;
     });
@@ -208,13 +348,15 @@ export class WatchStore {
       if (!row) return null;
       const token = randomUUID();
       this.run('UPDATE watches SET collect_token=?,collect_until_ms=? WHERE watch_id=?',token,now+leaseMs,row.watch_id);
+      this.run(`UPDATE manual_checks SET state='running',token=?
+        WHERE watch_id=? AND state IN ('queued','running')`,token,row.watch_id);
       return {...row,checkpoint:JSON.parse(row.checkpoint),token};
     });
   }
 
   apply(claim, obs, now, scheduled = true) {
     return this.transaction(() => {
-      const row = this.one("SELECT * FROM watches WHERE watch_id=? AND collect_token=? AND state='active'",claim.watch_id,claim.token);
+      const row = this.one("SELECT w.*,c.config FROM watches w JOIN watch_configs c USING(watch_id) WHERE watch_id=? AND collect_token=? AND state='active'",claim.watch_id,claim.token);
       if (!row) return false;
       if (row.deadline_ms !== null && now >= row.deadline_ms) {
         this.terminal(row,'deadline','deadline_reached',now);
@@ -235,7 +377,7 @@ export class WatchStore {
         evidence = {source_digest:payloadHash};
         if (obs.evidence) evidence.observation = obs.evidence;
         if (row.mode === 'until') {
-          truth = evaluatePredicate(obs.value,JSON.parse(row.definition).predicate);
+          truth = evaluatePredicate(obs.value,JSON.parse(row.config).predicate);
           if (truth === 'TRUE') kind = 'ready';
         } else if (row.mode === 'changes') {
           if (Object.hasOwn(checkpoint,'value')) {
@@ -281,10 +423,18 @@ export class WatchStore {
       if (kind === 'emitted') this.run('INSERT INTO emitted VALUES (?,?,?)',row.watch_id,seenKey,payloadHash);
       if (kind) this.append(row,kind,evidence,now);
       const state = kind === 'ready' ? 'ready' : 'active';
+      this.run(`UPDATE manual_checks SET state='completed',completed_ms=?,truth=?,coverage=?,code=?,token=NULL
+        WHERE watch_id=? AND state='running' AND token=?`,now,truth,coverage,code,row.watch_id,claim.token);
+      if (state === 'ready') {
+        this.bump(row.watch_id);
+        this.supersede(row.watch_id,now);
+      }
+      const queued = this.one("SELECT 1 AS n FROM manual_checks WHERE watch_id=? AND state='queued'",row.watch_id);
+      const due = queued ? now : now + row.interval_ms;
       this.run(`UPDATE watches SET checkpoint=?,coverage=?,authority=?,truth=?,code=?,state=?,next_read_ms=?,
         collect_token=NULL,collect_until_ms=NULL WHERE watch_id=?`,
         JSON.stringify(checkpoint),coverage,authority,truth,code,state,
-        state === 'active' && scheduled ? now+row.interval_ms : null,row.watch_id);
+        state === 'active' && scheduled ? due : null,row.watch_id);
       return true;
     });
   }
@@ -327,7 +477,7 @@ export class WatchStore {
         ? `AND w.consumer_id NOT IN (${skipConsumers.map(() => '?').join(',')})` : '';
       const row = this.one(`SELECT e.event_id,e.watch_id,e.sequence,e.body,w.consumer_id,o.attempt,r.fingerprint AS route_ref
         FROM outbox o JOIN events e USING(event_id) JOIN watches w USING(watch_id) JOIN delivery_routes r USING(consumer_id)
-        WHERE ((o.state='pending' AND o.next_ms<=?) OR (o.state='running' AND o.lease_ms<=?))
+        JOIN watch_configs c USING(watch_id) WHERE c.delivery_enabled=1 AND ((o.state='pending' AND o.next_ms<=?) OR (o.state='running' AND o.lease_ms<=?))
         AND NOT EXISTS (SELECT 1 FROM events p JOIN outbox prev USING(event_id)
           WHERE p.watch_id=e.watch_id AND p.sequence<e.sequence AND prev.state!='accepted')
         AND r.paused=0 ${consumerFilter} ORDER BY o.next_ms,e.rowid LIMIT 1`,now,now,...skipConsumers);
@@ -336,8 +486,9 @@ export class WatchStore {
       this.run(`UPDATE outbox SET state='running',attempt=attempt+1,token=?,lease_ms=?,
         max_attempts=CASE WHEN attempt=0 THEN ? ELSE max_attempts END,
         retry_base_ms=CASE WHEN attempt=0 THEN ? ELSE retry_base_ms END,
-        retry_cap_ms=CASE WHEN attempt=0 THEN ? ELSE retry_cap_ms END WHERE event_id=?`,
-        token,now+this.leaseMs,this.maxAttempts,this.baseDelayMs,this.maxDelayMs,row.event_id);
+        retry_cap_ms=CASE WHEN attempt=0 THEN ? ELSE retry_cap_ms END,
+        retry_jitter_ms=CASE WHEN attempt=0 THEN ? ELSE retry_jitter_ms END WHERE event_id=?`,
+        token,now+this.leaseMs,this.maxAttempts,this.baseDelayMs,this.maxDelayMs,this.retryJitterMs,row.event_id);
       return {...row,attempt:row.attempt+1,token};
     });
   }
@@ -361,12 +512,14 @@ export class WatchStore {
       return this.run(`UPDATE outbox SET state='pending',attempt=0,token=NULL,lease_ms=NULL,next_ms=?,code=?
         WHERE event_id=? AND state='running' AND token=?`,now,code,claim.event_id,claim.token).changes === 1;
     }
-    const row = this.one(`SELECT attempt,max_attempts,retry_cap_ms,retry_base_ms FROM outbox
+    const row = this.one(`SELECT attempt,max_attempts,retry_cap_ms,retry_base_ms,retry_jitter_ms FROM outbox
       WHERE event_id=? AND state='running' AND token=?`,claim.event_id,claim.token);
     if (!row) return false;
     const state = accepted ? 'accepted' : row.attempt >= row.max_attempts ? 'dead' : 'pending';
     const backoff = row.retry_base_ms * 2 ** (row.attempt-1);
-    const delay = Math.min(row.retry_cap_ms,Math.max(backoff,retryAfterMs));
+    const jitter = row.retry_jitter_ms === 0 ? 0 : createHash('sha256')
+      .update(`watch-retry-v1/${claim.event_id}/${row.attempt}`).digest().readUInt32BE() % (row.retry_jitter_ms + 1);
+    const delay = Math.min(row.retry_cap_ms,Math.max(backoff + jitter,retryAfterMs));
     return this.run(`UPDATE outbox SET state=?,next_ms=?,code=?,token=NULL,lease_ms=NULL
       WHERE event_id=? AND state='running' AND token=?`,state,now+delay,code,claim.event_id,claim.token).changes === 1;
   }

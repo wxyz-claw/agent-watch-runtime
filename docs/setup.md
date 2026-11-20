@@ -9,6 +9,64 @@ npm run demo
 
 The demo creates a fresh temporary directory, starts the loopback receiver and calls `watch_until` on a generated JSON fixture over MCP stdio. It closes the MCP connection and exits that server process. A headless worker reopens the watch database, observes the updated fixture and signs the pending event. The receiver commits the inbox item and a queued job. Its separate worker completes a local no-op handler. The demo reopens both databases, checks one accepted delivery and one completed job, prints their IDs and counts, and removes its temporary directory.
 
+## Install a pinned public checkout
+
+Set `WATCH_PUBLIC_REPO` to the public Git clone URL and `WATCH_PUBLIC_COMMIT` to a full, lowercase 40-hex commit ID you have independently verified. For the versioned controls, select a commit containing `docs/controls.md`. Use a new writable absolute directory in place of `/srv/watch-lab` throughout these examples. The checkout, tarball, consumer project and runtime state each have their own location.
+
+```sh
+(
+  set -eu
+  : "${WATCH_PUBLIC_REPO:?Set the public Git clone URL}"
+  : "${WATCH_PUBLIC_COMMIT:?Set the verified full commit ID}"
+  test "${#WATCH_PUBLIC_COMMIT}" -eq 40
+  lab=/srv/watch-lab
+  mkdir "$lab"
+  git clone --no-checkout -- "$WATCH_PUBLIC_REPO" "$lab/source"
+  pinned=$(git -C "$lab/source" rev-parse --verify "${WATCH_PUBLIC_COMMIT}^{commit}")
+  test "$pinned" = "$WATCH_PUBLIC_COMMIT"
+  git -C "$lab/source" checkout --detach "$pinned"
+  test "$(git -C "$lab/source" rev-parse HEAD)" = "$WATCH_PUBLIC_COMMIT"
+
+  mkdir "$lab/artifacts" "$lab/consumer"
+  cd "$lab/source"
+  archive=$(npm pack --ignore-scripts --silent --pack-destination "$lab/artifacts")
+  cd "$lab/consumer"
+  printf '%s\n' '{"name":"watch-consumer","version":"0.0.0","private":true}' > package.json
+  npm install --offline --ignore-scripts "$lab/artifacts/$archive"
+)
+```
+
+The package manifest keeps `"private": true`. npm builds and installs the local tarball directly. The package has no runtime dependencies.
+
+## Launch the installed MCP server
+
+Use absolute paths for the Node executable, the installed CLI and the isolated state directory. Substitute your supported Node binary for `/opt/node/bin/node`. From a different working directory, initialize state once and start the receiver.
+
+```sh
+cd /srv
+WATCH_NODE=/opt/node/bin/node
+WATCH_CLI=/srv/watch-lab/consumer/node_modules/agent-watch-runtime/bin/watch.mjs
+WATCH_STATE=/srv/watch-lab/state
+"$WATCH_NODE" "$WATCH_CLI" init "$WATCH_STATE"
+"$WATCH_NODE" "$WATCH_CLI" receive "$WATCH_STATE"
+```
+
+Keep the receiver running. Supply this launch record to the MCP client's stdio process launcher, adapting the field names to its configuration format.
+
+```json
+{
+  "transport": "stdio",
+  "command": "/opt/node/bin/node",
+  "args": [
+    "/srv/watch-lab/consumer/node_modules/agent-watch-runtime/bin/watch.mjs",
+    "serve",
+    "/srv/watch-lab/state"
+  ]
+}
+```
+
+The client can start in a directory outside the checkout and consumer project. Protocol fixtures exercise `initialize`, `notifications/initialized`, `tools/list` and `tools/call` over newline-delimited JSON-RPC. The suite checks protocol revisions `2025-11-25` and `2025-06-18`. The [verification ledger](work-ledger.md) tracks named client compatibility.
+
 ## Run separate processes
 
 Choose a fresh directory name whose parent exists. Supply the same directory to each command. Initialization creates the directory exclusively, a namespace marker, a generated signing key, the JSON fixture and separate SQLite files for the watch runtime and inbox.
@@ -20,7 +78,7 @@ node bin/watch.mjs receive ./watch-dev
 
 Keep the receiver running. It requests an ephemeral port from the OS on `127.0.0.1` and writes an authenticated registration inside the new directory. An OS-backed lock admits one receiver per directory and releases on process exit. The registration expires after five seconds without renewal. Sender attempts resolve the current registration and signing key ID while retaining the consumer and watch IDs. Receiver startup emits `{"state":"listening"}`. Completed asynchronous jobs emit a line with the watch ID, event ID and sequence. The local handler has no external effect.
 
-Configure an MCP client to launch the following command with an absolute path to the development directory. The server reads and writes newline-delimited JSON-RPC over stdin and stdout.
+From the repository root, start the same stdio server with the source checkout.
 
 ```sh
 node bin/watch.mjs serve ./watch-dev

@@ -19,11 +19,16 @@
     },
     "./sources": "./src/sources.mjs",
     "./delivery": "./src/delivery.mjs",
-    "./mcp": "./src/mcp.mjs"
+    "./mcp": "./src/mcp.mjs",
+    "./configuration": {
+      "types": "./src/configuration.d.mts",
+      "import": "./src/configuration.mjs"
+    }
   },
   "files": [
     "bin/watch.mjs",
     "docs/contract.md",
+    "docs/controls.md",
     "docs/setup.md",
     "docs/sources.md",
     "docs/work-ledger.md",
@@ -32,7 +37,10 @@
     "scripts/check-changedetection-replay.mjs",
     "scripts/check-node.mjs",
     "scripts/check-package.mjs",
+    "scripts/check-static.mjs",
     "src/config.mjs",
+    "src/configuration.d.mts",
+    "src/configuration.mjs",
     "src/delivery.mjs",
     "src/index.mjs",
     "src/mcp.mjs",
@@ -41,19 +49,26 @@
     "src/sdk.mjs",
     "src/sources.mjs",
     "src/store.mjs",
+    "test/configuration.test.mjs",
+    "test/control-cli.test.mjs",
+    "test/control-storage.test.mjs",
     "test/delivery.test.mjs",
+    "test/lifecycle.test.mjs",
     "test/mcp.test.mjs",
     "test/runtime.test.mjs",
     "test/sdk.test.mjs",
     "test/setup.test.mjs",
-    "test/sources.test.mjs"
+    "test/source-preview.test.mjs",
+    "test/sources.test.mjs",
+    "test/static.test.mjs"
   ],
   "scripts": {
     "check:node": "node scripts/check-node.mjs",
     "test": "node --test",
-    "test:contract": "node --test test/sdk.test.mjs test/mcp.test.mjs",
+    "test:contract": "node --test test/sdk.test.mjs test/configuration.test.mjs test/mcp.test.mjs",
     "demo": "node examples/demo.mjs",
     "check:package": "node scripts/check-package.mjs",
-    "verify": "npm run check:node && npm test && npm run check:package"
+    "verify": "npm run check:static && npm run check:node && npm test && npm run check:package",
+    "check:static": "node scripts/check-static.mjs"
   }
 }
