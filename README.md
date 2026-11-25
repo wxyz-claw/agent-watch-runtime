@@ -24,6 +24,8 @@ The demo creates a watch over MCP stdio and closes the client while the conditio
 
 Collection can be scheduled or driven by a trusted in-process upstream source. Incomplete evidence produces `UNKNOWN`. Delivery retries carry the immutable event ID and digest across process restarts and webhook configuration changes. Receiver acceptance, asynchronous processing and any downstream effect are separate operations. [Public contract and wire format](docs/contract.md)
 
+The `create_watch` tool takes a versioned configuration. Preview its predicate against a sample or the watch’s committed evidence, pause or resume collection, edit the configuration, or request a durable manual check. A per-watch delivery hold keeps committed events in their original order. [Watch controls](docs/controls.md)
+
 ## Integrate
 
 Import `WatchStore`, `WatchRuntime` and `Inbox` from `agent-watch-runtime`. The `agent-watch-runtime/sdk` entry point supplies the contract validators, canonical digest, JSON comparison and TypeScript declarations. The source registry accepts operator-configured adapters. The changedetection.io bridge reads retained snapshots through its documented v1 API. [Source interfaces and limits](docs/sources.md)

@@ -1,4 +1,5 @@
 import { pipeline } from 'node:stream/promises';
+import { normalizeConfig, normalizePatch } from './configuration.mjs';
 import { canonical, validatePredicate } from './sdk.mjs';
 
 const versions = ['2025-11-25', '2025-06-18'];
@@ -7,7 +8,8 @@ const identifier = { type: 'string', minLength: 1, maxLength: 128, pattern: '^[A
 const idPattern = new RegExp(identifier.pattern);
 const fixedErrors = new Set([
   'invalid_request', 'source_not_found', 'consumer_not_found', 'watch_not_found',
-  'request_conflict', 'capacity', 'store_error',
+  'request_conflict', 'capacity', 'store_error', 'revision_conflict', 'watch_terminal',
+  'watch_paused', 'operation_conflict', 'check_pending', 'unsupported_control',
 ]);
 const createProperties = {
   source_id: { ...identifier, description: 'Registered source identifier.' },
@@ -41,16 +43,77 @@ const historySchema = objectSchema({
   after_sequence: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER, default: 0, description: 'Last sequence already read.' },
   limit: { type: 'integer', minimum: 1, maximum: 50, default: 20, description: 'Maximum events in this page.' },
 }, ['watch_id']);
-const definitions = [
-  { name: 'watch_until', description: 'Observe a registered source until an authoritative snapshot satisfies the predicate.', inputSchema: untilSchema },
-  { name: 'watch_changes', description: 'Compare reliable snapshots and deliver observed changes.', inputSchema: createSchema },
-  { name: 'watch_emitted', description: 'Deliver source-emitted events with durable source identity.', inputSchema: createSchema },
-  { name: 'get_watch', description: 'Read watch status and delivery diagnostics.', inputSchema: existingSchema },
-  { name: 'cancel_watch', description: 'Cancel an active watch.', inputSchema: existingSchema },
-  { name: 'read_events', description: 'Read a page of committed events in per-watch sequence order.', inputSchema: historySchema },
+
+const configVersion = { type: 'integer', const: 1 };
+const editable = {
+  interval_ms: createProperties.interval_ms,
+  deadline_ms: { ...createProperties.deadline_ms, type: ['integer', 'null'], description: 'Absolute Unix time in milliseconds, or null for no deadline.' },
+  predicate: predicateSchema,
+  delivery: objectSchema({ enabled: { type: 'boolean' } }, ['enabled']),
+};
+const configSchema = {
+  ...objectSchema({
+    version: configVersion, mode: { type: 'string', enum: ['until', 'changes', 'emitted'] },
+    source_id: createProperties.source_id, consumer_id: createProperties.consumer_id, ...editable,
+  }, ['version', 'mode', 'source_id', 'consumer_id']),
+  if: { properties: { mode: { const: 'until' } }, required: ['mode'] },
+  then: { required: ['predicate'] },
+  else: { not: { required: ['predicate'] } },
+};
+const patchSchema = {
+  ...objectSchema({ version: configVersion, ...editable }, ['version']),
+  minProperties: 2,
+};
+const revisionFields = {
+  watch_id: identifier,
+  expected_revision: { type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER, description: 'Revision read from watch status.' },
+};
+const revisionSchema = objectSchema(revisionFields, ['watch_id', 'expected_revision']);
+const listSchema = objectSchema({
+  after: { ...identifier, description: 'Exclusive watch ID cursor from the previous page.' },
+  limit: { type: 'integer', minimum: 1, maximum: 50, default: 20 },
+  state: { type: 'string', enum: ['active', 'paused', 'ready', 'deadline', 'error', 'canceled'] },
+}, []);
+
+function tool(name, description, inputSchema, run) {
+  return { definition: { name, description, inputSchema }, run };
+}
+
+const tools = [
+  tool('watch_until', 'Observe a registered source until an authoritative snapshot satisfies the predicate.', untilSchema,
+    (runtime, args) => runtime.create('until', args)),
+  tool('watch_changes', 'Compare reliable snapshots and deliver observed changes.', createSchema,
+    (runtime, args) => runtime.create('changes', args)),
+  tool('watch_emitted', 'Deliver source-emitted events with durable source identity.', createSchema,
+    (runtime, args) => runtime.create('emitted', args)),
+  tool('get_watch', 'Read watch status and delivery diagnostics.', existingSchema,
+    (runtime, { watch_id }) => runtime.get(watch_id)),
+  tool('cancel_watch', 'Cancel an active or paused watch.', existingSchema,
+    (runtime, { watch_id }) => runtime.cancel(watch_id)),
+  tool('read_events', 'Read a page of committed events in per-watch sequence order.', historySchema,
+    (runtime, { watch_id, after_sequence = 0, limit = 20 }) => runtime.history(watch_id, { after_sequence, limit })),
+  tool('create_watch', 'Create a watch from a versioned configuration using a stable request ID.',
+    objectSchema({ config: configSchema, request_id: createProperties.request_id }, ['config', 'request_id']),
+    (runtime, { config, request_id }) => runtime.createConfigured(config, request_id)),
+  tool('preview_watch', 'Preview the proposed configuration for a new or existing watch.',
+    objectSchema({ config: configSchema, watch_id: identifier }, ['config']),
+    (runtime, { config, watch_id }) => runtime.preview(config, watch_id)),
+  tool('list_watches', 'List watch status in ascending watch ID order, optionally filtered by state.', listSchema,
+    (runtime, args) => runtime.list(args)),
+  tool('pause_watch', 'Pause collection at the expected watch revision.', revisionSchema,
+    (runtime, { watch_id, expected_revision }) => runtime.pause(watch_id, expected_revision)),
+  tool('resume_watch', 'Resume collection at the expected watch revision.', revisionSchema,
+    (runtime, { watch_id, expected_revision }) => runtime.resume(watch_id, expected_revision)),
+  tool('update_watch', 'Apply a versioned edit to a watch at its expected revision.',
+    objectSchema({ ...revisionFields, patch: patchSchema }, ['watch_id', 'expected_revision', 'patch']),
+    (runtime, { watch_id, expected_revision, patch }) => runtime.update(watch_id, expected_revision, patch)),
+  tool('check_now', 'Request one immediate check. Reuse the operation sequence when retrying that request.',
+    objectSchema({ ...revisionFields, operation_seq: { type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER } },
+      ['watch_id', 'expected_revision', 'operation_seq']),
+    (runtime, { watch_id, expected_revision, operation_seq }) => runtime.checkNow(watch_id, expected_revision, operation_seq)),
 ];
-const byName = new Map(definitions.map(tool => [tool.name, tool]));
-const modes = new Map([['watch_until', 'until'], ['watch_changes', 'changes'], ['watch_emitted', 'emitted']]);
+const definitions = tools.map(tool => tool.definition);
+const byName = new Map(tools.map(tool => [tool.definition.name, tool]));
 
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -79,7 +142,12 @@ function argumentsFor(tool, args) {
     if (field.type === 'integer' && !safeInteger(value, field.minimum, field.maximum)) {
       throw new Error('invalid_request');
     }
+    if (field.enum && !field.enum.includes(value)) throw new Error('invalid_request');
   }
+  // Defaults come from the operator's runtime. Validate the caller's nested
+  // data here and pass its original set of fields to the operation.
+  if (Object.hasOwn(args, 'config')) normalizeConfig(args.config);
+  if (Object.hasOwn(args, 'patch')) normalizePatch(args.patch);
   if (Object.hasOwn(args, 'predicate')) return { ...args, predicate: validatePredicate(args.predicate) };
   return args;
 }
@@ -96,18 +164,12 @@ function toolResult(data, isError = false) {
 async function callTool(runtime, tool, args) {
   let validated;
   try {
-    validated = argumentsFor(tool, args);
+    validated = argumentsFor(tool.definition, args);
   } catch {
     return toolResult({ error: 'invalid_request' }, true);
   }
   try {
-    let status;
-    if (tool.name === 'get_watch') status = await runtime.get(validated.watch_id);
-    else if (tool.name === 'cancel_watch') status = await runtime.cancel(validated.watch_id);
-    else if (tool.name === 'read_events') {
-      const { watch_id, after_sequence = 0, limit = 20 } = validated;
-      status = await runtime.history(watch_id, { after_sequence, limit });
-    } else status = await runtime.create(modes.get(tool.name), validated);
+    const status = await tool.run(runtime, validated);
     if (status === null || status === undefined) return toolResult({ error: 'watch_not_found' }, true);
     if (!isObject(status)) return toolResult({ error: 'store_error' }, true);
     return toolResult(status);

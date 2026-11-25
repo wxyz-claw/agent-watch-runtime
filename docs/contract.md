@@ -29,6 +29,13 @@ Use the MCP stdio tools or the equivalent JavaScript runtime methods. Create cal
 | `watch_until` | `await runtime.create('until', args)` |
 | `watch_changes` | `await runtime.create('changes', args)` |
 | `watch_emitted` | `await runtime.create('emitted', args)` |
+| `create_watch` | `await runtime.createConfigured(config, request_id)` |
+| `preview_watch` | `await runtime.preview(config, watch_id?)` |
+| `list_watches` | `runtime.list({after, limit, state})` |
+| `pause_watch` | `runtime.pause(watch_id, expected_revision)` |
+| `resume_watch` | `runtime.resume(watch_id, expected_revision)` |
+| `update_watch` | `runtime.update(watch_id, expected_revision, patch)` |
+| `check_now` | `await runtime.checkNow(watch_id, expected_revision, operation_seq)` |
 | `get_watch` | `runtime.get(watch_id)` |
 | `cancel_watch` | `runtime.cancel(watch_id)` |
 | `read_events` | `runtime.history(watch_id, {after_sequence, limit})` |
@@ -37,7 +44,9 @@ Use the MCP stdio tools or the equivalent JavaScript runtime methods. Create cal
 {"source_id":"sample","consumer_id":"worker","request_id":"first-run","predicate":{"path":"/phase","equals":"ready"}}
 ```
 
-The result includes `watch_id`, `state`, `sequence` and `truth`. Watch states are `active`, `ready`, `canceled`, `deadline` and `error`. Request identity is scoped to the consumer. Repeating an identical create returns the original watch. Reusing that request identity with different semantics is a conflict. The stable consumer ID identifies a logical inbox across transport retries or changes in webhook configuration. Route and signing-key changes preserve the watch, baseline, event IDs and checkpoints.
+The result includes `watch_id`, `state`, `sequence` and `truth`. Watch states are `active`, `paused`, `ready`, `canceled`, `deadline` and `error`. Request identity is scoped to the consumer. Repeating an identical create returns the original watch. Reusing that request identity with different semantics is a conflict. The stable consumer ID identifies a logical inbox across transport retries or changes in webhook configuration. Route and signing-key changes preserve the watch, baseline, event IDs and checkpoints.
+
+The configuration SDK accepts v1 configs and patches and computes stable redacted summaries. Import `normalizeConfig`, `normalizePatch` and `configSummary` from `agent-watch-runtime/configuration`. A watch has a separate positive `revision`. A meaningful edit or lifecycle transition increments it. Ordinary collection, collection retries and delivery leave the revision stable. A repeated create matches the original creation configuration even after edits. [Control semantics and examples](controls.md)
 
 IDs supplied by a control client use 1–128 ASCII letters, digits, dots, underscores or hyphens, starting with an alphanumeric character. The default interval is 1,000 ms and the supported interval range is 20 ms through 24 hours. Creation attempts the initial read immediately. If a source or collection slot is busy, the scheduler picks up the due watch. A deadline which has already passed ends the watch before another source read.
 
@@ -46,6 +55,8 @@ Register a `Map` of source IDs and a separate `Map` of consumer routes when cons
 Secondary history accepts an exclusive `after_sequence` (default 0) and `limit` (default 20, range 1–50). It returns `{events,next_sequence,has_more}` in per-watch order. Pages also have a 64 KiB size budget. Continue from the last returned sequence. Reading history leaves sender delivery state and receiver work state untouched. This stdio interface negotiates protocol revisions 2025-11-25 and 2025-06-18. [MCP stdio specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports) · [MCP tools specification](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)
 
 ## Events and persistence
+
+The SQLite runtime schema is v4. Opening a v1, v2 or v3 development store upgrades its configuration and retry metadata in one transaction. Each existing watch starts at revision 1 with delivery enabled. Its original creation signature, checkpoint, events and existing delivery deadlines retain their values. Use a separate development store when testing a newer runtime alongside an older one.
 
 The runtime assigns a stable watch ID and a per-watch sequence starting at 1. Within one SQLite transaction it commits the accepted checkpoint, immutable event bytes and the pending delivery row. An event carries exactly `version`, `event_id`, `watch_id`, `sequence`, `kind`, `observed_at`, `evidence` and `digest`. Kinds are `ready`, `changed`, `emitted`, `deadline`, `canceled` and `error`.
 
@@ -73,7 +84,7 @@ A 2xx response confirms that the receiver committed the inbox record and asynchr
 
 The receiver returns 202 for newly committed work, 200 for a matching duplicate and 409 for a conflicting ID, digest or sequence. It accepts a unique key ID header and signatures up to five minutes from its clock by default. To rotate keys, install the new receiver key, change the sender's route for the same consumer and retain the original inbox across callback changes. The consumer may accept both key IDs during the transition. A new, empty logical inbox needs its own consumer and watch.
 
-Default sender retry policy is six attempts with exponential backoff from 250 ms to 60 seconds. The first sending attempt records the route's attempt and delay policy for the event. Restarts preserve that policy and its due time. For HTTP 429 or 503, a valid `Retry-After` in seconds or an HTTP date can increase the delay up to the configured ceiling. Invalid hints use the normal backoff. `get_watch` exposes queue counts, the head event, attempt count, next retry, lease and first dead letter. An exhausted predecessor blocks delivery of later events on that watch.
+Default sender retry policy is six attempts with exponential backoff from 250 ms to 60 seconds. The first sending attempt records the route's attempt and delay policy for the event. Restarts preserve that policy and its due time. For HTTP 429 or 503, a valid `Retry-After` in seconds or an HTTP date can increase the delay up to the configured ceiling. Invalid hints use the normal backoff. The optional `WatchStore` setting `retryJitterMs` accepts 0–60,000 ms and defaults to zero. On each retry it adds a reproducible offset between zero and that setting to the exponential delay, then applies the server hint as a floor and the configured ceiling. The offset is derived from the immutable event ID and attempt number. The first claim persists the jitter setting alongside the retry policy. `get_watch` exposes queue counts, the head event, attempt count, next retry, lease and first dead letter. An exhausted predecessor blocks delivery of later events on that watch.
 
 HTTP 410 from the current destination pauses outstanding and future delivery to that consumer. Status exposes `delivery_paused` and a `paused` head with code `endpoint_gone`. The pause survives process restarts. Repair the registered route or, after repairing the same destination, call the operator SDK method `runtime.resumeDelivery(consumerId)`. Changed callback or signing configuration fences old attempts, clears the pause and gives pending events the new destination's attempt budget. A late 410 or 2xx from the retired destination cannot decide the new destination's state. Every worker for a consumer should resolve its current route from the same operator configuration. In-flight requests, retries, pauses and key changes preserve observation checkpoints and immutable event bytes.
 
