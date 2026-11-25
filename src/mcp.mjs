@@ -9,7 +9,7 @@ const idPattern = new RegExp(identifier.pattern);
 const fixedErrors = new Set([
   'invalid_request', 'source_not_found', 'consumer_not_found', 'watch_not_found',
   'request_conflict', 'capacity', 'store_error', 'revision_conflict', 'watch_terminal',
-  'watch_paused', 'operation_conflict', 'check_pending', 'unsupported_control',
+  'watch_paused', 'operation_conflict', 'check_pending', 'unsupported_control', 'not_dead_letter',
 ]);
 const createProperties = {
   source_id: { ...identifier, description: 'Registered source identifier.' },
@@ -111,6 +111,9 @@ const tools = [
     objectSchema({ ...revisionFields, operation_seq: { type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER } },
       ['watch_id', 'expected_revision', 'operation_seq']),
     (runtime, { watch_id, expected_revision, operation_seq }) => runtime.checkNow(watch_id, expected_revision, operation_seq)),
+  tool('redrive_delivery', 'Requeue exhausted deliveries on a watch with a fresh attempt budget. Omit event_id to requeue every dead letter.',
+    objectSchema({ watch_id: identifier, event_id: { ...identifier, description: 'One dead-letter event ID from get_watch.' } }, ['watch_id']),
+    (runtime, { watch_id, event_id = null }) => runtime.redrive(watch_id, { event_id })),
 ];
 const definitions = tools.map(tool => tool.definition);
 const byName = new Map(tools.map(tool => [tool.definition.name, tool]));

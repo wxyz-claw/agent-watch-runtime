@@ -282,6 +282,55 @@ export class Inbox {
 
   close() { this.#db.close(); }
 
+  /**
+   * Operator recovery for a dead job, which blocks later events on its watch. `retry` queues it
+   * with a fresh attempt budget. `skip` records it as done without running the handler, which
+   * releases its successors; the receipt stays, so a resend is still a duplicate.
+   */
+  redrive(consumerId, eventId, { action = 'retry', now = Date.now() } = {}) {
+    if (!safeId(consumerId) || !safeId(eventId) || !['retry', 'skip'].includes(action) ||
+        !integer(now, 0, Number.MAX_SAFE_INTEGER)) throw new Error('invalid_request');
+    return atomic(this.#db, () => {
+      const result = action === 'retry'
+        ? this.#db.prepare(`UPDATE jobs SET state='queued',attempts=0,available_at=?,token=NULL,lease_until=NULL,
+            code='operator_redriven' WHERE consumer_id=? AND event_id=? AND state='dead'`).run(now, consumerId, eventId)
+        : this.#db.prepare(`UPDATE jobs SET state='done',available_at=?,token=NULL,lease_until=NULL,
+            code='operator_skipped' WHERE consumer_id=? AND event_id=? AND state='dead'`).run(now, consumerId, eventId);
+      if (!result.changes) throw new Error('not_dead_letter');
+      return this.status(consumerId, eventId);
+    });
+  }
+
+  /** Dead jobs, oldest first, so an operator can find what blocks each watch. */
+  deadLetters(consumerId, { limit = 50 } = {}) {
+    if (!safeId(consumerId) || !integer(limit, 1, 500)) throw new Error('invalid_request');
+    return this.#db.prepare(`SELECT i.event_id,i.watch_id,i.sequence,j.attempts,j.code,j.available_at
+      FROM jobs j JOIN inbox i USING(consumer_id,event_id) WHERE i.consumer_id=? AND j.state='dead'
+      ORDER BY i.watch_id,i.sequence LIMIT ?`).all(consumerId, limit).map(row => ({ ...row }));
+  }
+
+  /**
+   * Remove completed receipts finished before now - retentionMs. A receipt is removed only when
+   * the next sequence of its watch is also done, so ordering of queued work and duplicate
+   * detection for pruned events both keep a retained successor. Bounded by limit per call.
+   */
+  prune(now, retentionMs, limit = 256) {
+    if (!integer(now, 0, Number.MAX_SAFE_INTEGER) || !integer(retentionMs, 0, Number.MAX_SAFE_INTEGER) ||
+        !integer(limit, 1, 10_000)) throw new Error('invalid_request');
+    return atomic(this.#db, () => {
+      const rows = this.#db.prepare(`SELECT i.consumer_id,i.event_id FROM inbox i JOIN jobs j USING(consumer_id,event_id)
+        WHERE j.state='done' AND j.available_at<=? AND EXISTS (
+          SELECT 1 FROM inbox n JOIN jobs nj USING(consumer_id,event_id)
+          WHERE n.consumer_id=i.consumer_id AND n.watch_id=i.watch_id AND n.sequence=i.sequence+1 AND nj.state='done')
+        ORDER BY j.available_at LIMIT ?`).all(now - retentionMs, limit);
+      for (const row of rows) {
+        this.#db.prepare('DELETE FROM jobs WHERE consumer_id=? AND event_id=?').run(row.consumer_id, row.event_id);
+        this.#db.prepare('DELETE FROM inbox WHERE consumer_id=? AND event_id=?').run(row.consumer_id, row.event_id);
+      }
+      return rows.length;
+    });
+  }
+
   /** Called after the HTTP signature is verified. Bind the receipt to the exact validated bytes. */
   accept(consumerId, body, now) {
     if (!safeId(consumerId) || !Buffer.isBuffer(body) || !integer(now, 0, Number.MAX_SAFE_INTEGER)) {
@@ -296,6 +345,13 @@ export class Inbox {
         'SELECT digest FROM inbox WHERE consumer_id=? AND event_id=?'
       ).get(consumerId, event_id);
       if (receipt) return receipt.digest === digest ? 'duplicate' : 'conflict';
+      // A job completes only after every earlier sequence of its watch completed, and retention
+      // keeps the newest completed receipt. A missing receipt below a completed sequence was
+      // therefore completed and pruned, so a resend is a duplicate.
+      const later = this.#db.prepare(`SELECT 1 FROM inbox i JOIN jobs j USING(consumer_id,event_id)
+        WHERE i.consumer_id=? AND i.watch_id=? AND i.sequence>? AND j.state='done' LIMIT 1`
+      ).get(consumerId, watch_id, sequence);
+      if (later) return 'duplicate';
       const occupied = this.#db.prepare(
         'SELECT 1 FROM inbox WHERE consumer_id=? AND watch_id=? AND sequence=?'
       ).get(consumerId, watch_id, sequence);

@@ -14,15 +14,18 @@ function unavailable(mode, code) {
 
 export class WatchRuntime {
   constructor({store,sources,routes,now = Date.now,collectTimeoutMs = 3000,deliveryTimeoutMs = 3000,
-    intervalMs = 1000,parallelism = 4} = {}) {
-    if (!store || !(sources instanceof Map) || !(routes instanceof Map) || typeof now !== 'function' ||
+    intervalMs = 1000,parallelism = 4,retentionMs = 7 * 86400000,pruneIntervalMs = 60000} = {}) {
+    if (!store || (retentionMs !== null && !integer(retentionMs,0,Number.MAX_SAFE_INTEGER)) ||
+        !integer(pruneIntervalMs,1,86400000) || !(sources instanceof Map) || !(routes instanceof Map) || typeof now !== 'function' ||
         !integer(intervalMs,20,86400000) || !integer(parallelism,1,32) ||
         !integer(collectTimeoutMs,1,60000) || !integer(deliveryTimeoutMs,1,30000)) throw Error('invalid_request');
     for (const [name,read] of sources) {
       if (!isId(name) || (typeof read !== 'function' && read !== null)) throw Error('invalid_request');
     }
     for (const name of routes.keys()) if (!isId(name)) throw Error('invalid_request');
-    Object.assign(this,{store,sources,routes,now,collectTimeoutMs,deliveryTimeoutMs,intervalMs,parallelism});
+    Object.assign(this,{store,sources,routes,now,collectTimeoutMs,deliveryTimeoutMs,intervalMs,parallelism,
+      retentionMs,pruneIntervalMs});
+    this.nextPruneMs = 0;
     this.busySources = new Set();
     this.previews = new Map();
     this.busyConsumers = new Set();
@@ -196,6 +199,18 @@ export class WatchRuntime {
     return this.store.resumeDelivery(consumerId,this.now());
   }
 
+  // Operator recovery: return exhausted deliveries on one watch to the queue with a fresh budget.
+  redrive(watchId, {event_id = null} = {}) {
+    if (!isId(watchId) || (event_id !== null && !isId(event_id))) throw Error('invalid_request');
+    return this.store.redrive(watchId,this.now(),event_id);
+  }
+
+  // Bounded retention pass. pulse() runs it every pruneIntervalMs unless retention is disabled.
+  prune({limit = 256} = {}) {
+    if (this.retentionMs === null) return {watches:0,events:0};
+    return this.store.prune(this.now(),this.retentionMs,limit);
+  }
+
   // Trusted in-process source entry point. A null reader registers an event-driven source.
   ingest(sourceId, watchId, observation) {
     if (!this.sources.has(sourceId) || this.sources.get(sourceId) !== null) throw Error('source_not_found');
@@ -257,6 +272,10 @@ export class WatchRuntime {
   pulse() {
     const now = this.now();
     this.store.expire(now);
+    if (this.retentionMs !== null && now >= this.nextPruneMs) {
+      this.nextPruneMs = now + this.pruneIntervalMs;
+      this.store.prune(now,this.retentionMs);
+    }
     const started = [];
     while (this.reads.size < this.parallelism) {
       const claim = this.store.claimObservation(now,{skipSources:[...this.busySources],leaseMs:this.collectionLease()});

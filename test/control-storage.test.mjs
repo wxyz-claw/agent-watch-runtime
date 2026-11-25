@@ -96,7 +96,7 @@ test('opening a v3 store preserves a pending retry and the original watch across
   const legacy = { source_id: 'sample', consumer_id: 'worker', request_id: 'initial', interval_ms: 250 };
   const config = { version: 1, mode: 'changes', source_id: 'sample', consumer_id: 'worker', interval_ms: 250 };
   const original = runtime.get('watch-v3');
-  assert.equal(store.one('PRAGMA user_version').user_version, 4);
+  assert.equal(store.one('PRAGMA user_version').user_version, 5);
   assert.equal(original.revision, 1);
   assert.equal(original.delivery_enabled, true);
   assert.equal(original.reads, 3);

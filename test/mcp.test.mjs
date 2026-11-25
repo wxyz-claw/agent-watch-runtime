@@ -65,6 +65,7 @@ test('tools become available after negotiated initialization and a client notifi
   assert.deepEqual(list.map(x => x.name), [
     'watch_until', 'watch_changes', 'watch_emitted', 'get_watch', 'cancel_watch', 'read_events',
     'create_watch', 'preview_watch', 'list_watches', 'pause_watch', 'resume_watch', 'update_watch', 'check_now',
+    'redrive_delivery',
   ]);
   assert.ok(list.every(tool => tool.inputSchema.additionalProperties === false));
   assert.deepEqual(list[0].inputSchema.required, ['source_id', 'consumer_id', 'request_id', 'predicate']);

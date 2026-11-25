@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { setTimeout as delay } from 'node:timers/promises';
 
+const RECEIPT_RETENTION_MS = 30 * 86_400_000;
 const write = value => process.stdout.write(JSON.stringify(value) + '\n');
 
 async function runReceiver(dev, signal, claimReceiver) {
@@ -17,10 +18,16 @@ async function runReceiver(dev, signal, claimReceiver) {
     registration.publish(server.address().port);
     write({state: 'listening'});
     let nextRefresh = Date.now() + 1000;
+    let nextPrune = 0;
     while (!signal.aborted) {
       if (Date.now() >= nextRefresh) {
         registration.refresh();
         nextRefresh = Date.now() + 1000;
+      }
+      // Completed receipts older than 30 days are pruned once a minute, in bounded batches.
+      if (Date.now() >= nextPrune) {
+        inbox.prune(Date.now(), RECEIPT_RETENTION_MS);
+        nextPrune = Date.now() + 60_000;
       }
       // The synthetic handler has no external effect. A worker row reaches done
       // only after this callback resolves and the inbox commits completion.
