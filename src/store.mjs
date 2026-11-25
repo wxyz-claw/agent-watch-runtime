@@ -22,6 +22,17 @@ const controlsSchema = `
   INSERT INTO watch_configs(watch_id,config) SELECT watch_id,
     json_set(json_remove(definition,'$.request_id'),'$.version',1,'$.delivery',json('{"enabled":true}')) FROM watches;
 `;
+// v5 records when delivery settled and when a watch ended, so retention can prune
+// settled history and finished watches without touching undelivered work.
+const retentionSchema = `
+  ALTER TABLE outbox ADD COLUMN settled_ms INTEGER;
+  ALTER TABLE watches ADD COLUMN ended_ms INTEGER;
+  ALTER TABLE watches ADD COLUMN pruned_through INTEGER NOT NULL DEFAULT 0;
+  CREATE INDEX delivery_settled ON outbox(state,settled_ms);
+  CREATE INDEX watch_ended ON watches(state,ended_ms);
+`;
+const terminalStates = ['ready','canceled','deadline','error'];
+const settled = "('accepted')";
 const APP_ID = 0x41575231;
 const deliveryCodes = new Set(['accepted', 'route_unavailable', 'invalid_event', 'delivery_timeout',
   'transport_error', 'response_too_large', 'http_rejected', 'endpoint_gone', 'rate_limited', 'route_changed']);
@@ -74,7 +85,11 @@ export class WatchStore {
       this.transaction(() => {
         const {application_id} = this.one('PRAGMA application_id');
         const {user_version} = this.one('PRAGMA user_version');
-        if (application_id === APP_ID && user_version === 4) return;
+        if (application_id === APP_ID && user_version === 5) return;
+        if (application_id === APP_ID && user_version === 4) {
+          this.upgradeRetention();
+          return;
+        }
         if (application_id === APP_ID && [1,2].includes(user_version)) {
           if (user_version === 1) {
             this.db.exec(`ALTER TABLE outbox ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 6;
@@ -92,13 +107,22 @@ export class WatchStore {
           throw Error('store_error');
         }
         this.db.exec(controlsSchema);
-        this.db.exec('PRAGMA user_version=4');
+        this.upgradeRetention();
       });
       this.db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON');
     } catch {
       this.db.close();
       throw Error('store_error');
     }
+  }
+
+  // Existing settled rows and finished watches start their retention clock at upgrade time.
+  upgradeRetention() {
+    const now = Date.now();
+    this.db.exec(retentionSchema);
+    this.run(`UPDATE outbox SET settled_ms=? WHERE state IN ${settled}`,now);
+    this.run(`UPDATE watches SET ended_ms=? WHERE state IN (${terminalStates.map(() => '?').join(',')})`,now,...terminalStates);
+    this.db.exec('PRAGMA user_version=5');
   }
 
   close() { this.db.close(); }
@@ -148,7 +172,7 @@ export class WatchStore {
 
   readStatus(watchId) {
     const row = this.one(`SELECT watch_id,source_id,consumer_id,mode,state,sequence,truth,coverage,authority,code,
-      next_read_ms,deadline_ms,json_extract(checkpoint,'$.reads') AS reads,config,revision,delivery_enabled
+      next_read_ms,deadline_ms,json_extract(checkpoint,'$.reads') AS reads,pruned_through,config,revision,delivery_enabled
       FROM watches JOIN watch_configs USING(watch_id) WHERE watch_id=?`,watchId);
     if (!row) throw Error('watch_not_found');
     const delivery = {pending:0,running:0,accepted:0,dead:0};
@@ -157,10 +181,11 @@ export class WatchStore {
     const failure = this.one(`SELECT o.code,e.event_id,e.sequence,o.attempt,o.max_attempts FROM outbox o JOIN events e USING(event_id)
       WHERE e.watch_id=? AND o.state='dead' ORDER BY e.sequence LIMIT 1`,watchId);
     const next = this.one(`SELECT e.event_id,e.sequence,o.state,o.attempt,o.max_attempts,o.next_ms,o.lease_ms,o.code
-      FROM outbox o JOIN events e USING(event_id) WHERE e.watch_id=? AND o.state!='accepted' ORDER BY e.sequence LIMIT 1`,watchId);
+      FROM outbox o JOIN events e USING(event_id) WHERE e.watch_id=? AND o.state NOT IN ${settled} ORDER BY e.sequence LIMIT 1`,watchId);
+    const retained = this.one('SELECT COUNT(*) AS n FROM events WHERE watch_id=?',watchId).n;
     const route = this.one('SELECT paused FROM delivery_routes WHERE consumer_id=?',row.consumer_id);
     const {config,...status} = row;
-    return {...status,config_version:1,configuration:configSummary(JSON.parse(config)),delivery_enabled:Boolean(row.delivery_enabled),
+    return {...status,retained_events:retained,config_version:1,configuration:configSummary(JSON.parse(config)),delivery_enabled:Boolean(row.delivery_enabled),
       manual_check:this.manualCheck(watchId),delivery,delivery_paused:route.paused === 1,delivery_head:next ? {...next} : null,
       dead_letter:failure ? {...failure} : null};
   }
@@ -270,7 +295,12 @@ export class WatchStore {
 
   history(watchId, {after_sequence = 0, limit = 20} = {}) {
     if (!validBound(after_sequence,0,Number.MAX_SAFE_INTEGER) || !validBound(limit,1,50)) throw Error('invalid_request');
-    if (!this.one('SELECT 1 FROM watches WHERE watch_id=?',watchId)) throw Error('watch_not_found');
+    return this.transaction(() => this.readHistory(watchId,after_sequence,limit),true);
+  }
+
+  readHistory(watchId, after_sequence, limit) {
+    const watch = this.one('SELECT pruned_through FROM watches WHERE watch_id=?',watchId);
+    if (!watch) throw Error('watch_not_found');
     let bytes = 0;
     let next_sequence = after_sequence;
     let has_more = false;
@@ -288,7 +318,8 @@ export class WatchStore {
     }
     const events = this.db.prepare(`SELECT body FROM events WHERE watch_id=? AND sequence>? AND sequence<=?
       ORDER BY sequence`).all(watchId,after_sequence,next_sequence).map(row => JSON.parse(row.body));
-    return {events,next_sequence,has_more};
+    // Retention removes settled history. A cursor at or below pruned_through skipped removed events.
+    return {events,next_sequence,has_more,pruned_through:watch.pruned_through};
   }
 
   append(row, kind, evidence, now) {
@@ -307,8 +338,8 @@ export class WatchStore {
     this.supersede(row.watch_id,now);
     if (bump) this.bump(row.watch_id);
     this.append(row,kind,code ? {code} : {},now);
-    this.run(`UPDATE watches SET state=?,code=?,next_read_ms=NULL,collect_token=NULL,collect_until_ms=NULL
-      WHERE watch_id=?`,kind,code,row.watch_id);
+    this.run(`UPDATE watches SET state=?,code=?,ended_ms=?,next_read_ms=NULL,collect_token=NULL,collect_until_ms=NULL
+      WHERE watch_id=?`,kind,code,now,row.watch_id);
   }
 
   cancel(watchId, now) {
@@ -409,7 +440,9 @@ export class WatchStore {
         }
 
         // Reserve one event slot for a terminal outcome, including explicit capacity exhaustion.
-        if (kind && kind !== 'ready' && row.sequence >= this.maxEventsPerWatch - 1) {
+        // The limit counts retained events, so retention lets a long-lived watch continue.
+        if (kind && kind !== 'ready' &&
+            this.one('SELECT COUNT(*) AS n FROM events WHERE watch_id=?',row.watch_id).n >= this.maxEventsPerWatch - 1) {
           this.terminal(row,'error','capacity',now);
           return false;
         }
@@ -479,7 +512,7 @@ export class WatchStore {
         FROM outbox o JOIN events e USING(event_id) JOIN watches w USING(watch_id) JOIN delivery_routes r USING(consumer_id)
         JOIN watch_configs c USING(watch_id) WHERE c.delivery_enabled=1 AND ((o.state='pending' AND o.next_ms<=?) OR (o.state='running' AND o.lease_ms<=?))
         AND NOT EXISTS (SELECT 1 FROM events p JOIN outbox prev USING(event_id)
-          WHERE p.watch_id=e.watch_id AND p.sequence<e.sequence AND prev.state!='accepted')
+          WHERE p.watch_id=e.watch_id AND p.sequence<e.sequence AND prev.state NOT IN ${settled})
         AND r.paused=0 ${consumerFilter} ORDER BY o.next_ms,e.rowid LIMIT 1`,now,now,...skipConsumers);
       if (!row) return null;
       const token = randomUUID();
@@ -520,7 +553,54 @@ export class WatchStore {
     const jitter = row.retry_jitter_ms === 0 ? 0 : createHash('sha256')
       .update(`watch-retry-v1/${claim.event_id}/${row.attempt}`).digest().readUInt32BE() % (row.retry_jitter_ms + 1);
     const delay = Math.min(row.retry_cap_ms,Math.max(backoff + jitter,retryAfterMs));
-    return this.run(`UPDATE outbox SET state=?,next_ms=?,code=?,token=NULL,lease_ms=NULL
-      WHERE event_id=? AND state='running' AND token=?`,state,now+delay,code,claim.event_id,claim.token).changes === 1;
+    return this.run(`UPDATE outbox SET state=?,next_ms=?,code=?,token=NULL,lease_ms=NULL,settled_ms=?
+      WHERE event_id=? AND state='running' AND token=?`,state,now+delay,code,accepted ? now : null,
+      claim.event_id,claim.token).changes === 1;
+  }
+
+  // Operator recovery for exhausted deliveries. Each dead row on the watch returns to pending
+  // with a fresh attempt budget under the current policy, in its original sequence order.
+  // The event ID, digest and bytes are unchanged, so the receiver deduplicates a prior commit.
+  redrive(watchId, now, eventId = null) {
+    return this.transaction(() => {
+      if (!this.one('SELECT 1 FROM watches WHERE watch_id=?',watchId)) throw Error('watch_not_found');
+      const filter = eventId === null ? '' : 'AND event_id=?';
+      const args = eventId === null ? [now,watchId] : [now,watchId,eventId];
+      const {changes} = this.run(`UPDATE outbox SET state='pending',attempt=0,token=NULL,lease_ms=NULL,next_ms=?,
+        code='operator_redriven' WHERE state='dead' AND event_id IN (SELECT event_id FROM events WHERE watch_id=?) ${filter}`,
+        ...args);
+      if (eventId !== null && changes === 0) throw Error('not_dead_letter');
+      return {redriven:changes,status:this.get(watchId)};
+    });
+  }
+
+  // Remove history whose delivery settled before the cutoff, then finished watches whose
+  // deliveries have all settled. Undelivered, dead and paused rows are never removed.
+  // Each call does bounded work. Removing a finished watch releases its request identity.
+  prune(now, retentionMs, limit = 256) {
+    if (!validBound(retentionMs,0,Number.MAX_SAFE_INTEGER) || !validBound(limit,1,10000)) throw Error('invalid_request');
+    const cutoff = now - retentionMs;
+    return this.transaction(() => {
+      const watches = this.db.prepare(`SELECT watch_id FROM watches w
+        WHERE state IN (${terminalStates.map(() => '?').join(',')}) AND ended_ms<=?
+        AND NOT EXISTS (SELECT 1 FROM events e JOIN outbox o USING(event_id)
+          WHERE e.watch_id=w.watch_id AND (o.state NOT IN ${settled} OR o.settled_ms>?))
+        ORDER BY ended_ms LIMIT ?`).all(...terminalStates,cutoff,cutoff,limit).map(row => row.watch_id);
+      let events = 0;
+      for (const watchId of watches) {
+        this.run('DELETE FROM outbox WHERE event_id IN (SELECT event_id FROM events WHERE watch_id=?)',watchId);
+        events += this.run('DELETE FROM events WHERE watch_id=?',watchId).changes;
+        for (const table of ['emitted','manual_checks','watch_configs']) this.run(`DELETE FROM ${table} WHERE watch_id=?`,watchId);
+        this.run('DELETE FROM watches WHERE watch_id=?',watchId);
+      }
+      const rows = this.db.prepare(`SELECT e.event_id,e.watch_id,e.sequence FROM outbox o JOIN events e USING(event_id)
+        WHERE o.state IN ${settled} AND o.settled_ms<=? ORDER BY o.settled_ms LIMIT ?`).all(cutoff,limit);
+      for (const row of rows) {
+        this.run('DELETE FROM outbox WHERE event_id=?',row.event_id);
+        this.run('DELETE FROM events WHERE event_id=?',row.event_id);
+        this.run('UPDATE watches SET pruned_through=max(pruned_through,?) WHERE watch_id=?',row.sequence,row.watch_id);
+      }
+      return {watches:watches.length,events:events + rows.length};
+    });
   }
 }

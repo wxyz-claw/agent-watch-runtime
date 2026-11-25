@@ -280,7 +280,7 @@ test('read-only history resumes from an exclusive per-watch sequence with no del
   const rest = h.rt.history(watch_id,{after_sequence:first.next_sequence});
   assert.deepEqual(rest.events.map(e => e.sequence),[3,4,5]);
   assert.equal(rest.has_more,false);
-  assert.deepEqual(h.rt.history(watch_id,{after_sequence:rest.next_sequence}),{events:[],has_more:false,next_sequence:5});
+  assert.deepEqual(h.rt.history(watch_id,{after_sequence:rest.next_sequence}),{events:[],has_more:false,next_sequence:5,pruned_through:0});
   assert.deepEqual(h.rt.get(watch_id),status);
   assert.throws(() => h.rt.history(watch_id,{limit:51}),/invalid_request/);
 });
@@ -320,9 +320,11 @@ test('v1 store upgrades preserve existing immutable bytes and seed durable retry
   const original = events(h.store,watch_id);
   h.store.db.exec(`ALTER TABLE outbox DROP COLUMN max_attempts; ALTER TABLE outbox DROP COLUMN retry_base_ms;
     ALTER TABLE outbox DROP COLUMN retry_cap_ms; ALTER TABLE outbox DROP COLUMN retry_jitter_ms;
+    DROP INDEX delivery_settled; DROP INDEX watch_ended; ALTER TABLE outbox DROP COLUMN settled_ms;
+    ALTER TABLE watches DROP COLUMN ended_ms; ALTER TABLE watches DROP COLUMN pruned_through;
     DROP TABLE manual_checks; DROP TABLE watch_configs; DROP TABLE delivery_routes; PRAGMA user_version=1;`);
   await h.reopen();
-  assert.equal(h.store.one('PRAGMA user_version').user_version,4);
+  assert.equal(h.store.one('PRAGMA user_version').user_version,5);
   assert.deepEqual(events(h.store,watch_id),original);
   assert.equal(h.rt.get(watch_id).delivery_head.max_attempts,6);
 });
